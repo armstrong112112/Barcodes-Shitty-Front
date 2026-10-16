@@ -8,14 +8,7 @@
 
 ## Архитектурное решение
 
-Старую runtime-логику не нужно чинить, ограничивать allowlist-ами или сохранять ради совместимости — её можно полностью удалить из BFF:
-
-* удалить `ApplyEngineDefaults` и профильный раздел `defaults`;
-* удалить `applyChoiceFallbacks` из `prepare` и `generate`;
-* удалить неиспользуемый старый `CalculationChain` и state-specific ветки, дублирующие BarcodeGen;
-* не переносить эти правила в новый compatibility-layer.
-
-Неизменяемые значения формата (`QQQ="DL"`, MI `DDB="Rev 01-21-2011"`) не оправдывают сохранение универсального механизма BFF defaults: их нужно задавать явным literal-шагом новой цепочки либо внутри профиля ревизии BarcodeGen. В BFF остаются transport/auth/billing/idempotency, базовая валидация и общий `ChainExecutor`; декларативные schema, required-поля, allowlist и `generationSteps` могут описывать новый Auto Flow, но не должны содержать скрытые legacy-подстановки или state-specific вычисления.
+Эти шесть ревизий должны работать по тому же Auto Flow, что и все остальные. Отдельную legacy-логику для них в BFF нужно удалить, не перенося её в новый flow.
 
 ## Где сейчас появляются скрытые значения
 
@@ -141,7 +134,7 @@
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
   * `suffix` (`DCU`) — `""`, `JR`, `SR`, `1ST`..`9TH`;
-  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
+  * `sex` (`DBC`) — `1` | `2`, нач��льное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
@@ -203,11 +196,7 @@
 
 ## Ожидаемый результат
 
-После полного удаления legacy execution-layer из BFF эти шесть ревизий должны проходить только через новый общий Auto Flow, как рабочие профили:
-
-`declarative schema/generationSteps → prepare/ExecuteGrouped → prepared draft → exact BarcodeGen builder → render`.
-
-Никакого параллельного пути через defaults, runtime fallback-ы или старые state-specific расчёты после этого не остаётся.
+Эти шесть ревизий работают по стандартному Auto Flow, который уже используется всеми остальными ревизиями, без отдельной legacy-логики в BFF.
 
 Отдельные исключения остаются только там, где этого действительно требует builder:
 
