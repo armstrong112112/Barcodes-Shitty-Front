@@ -1,31 +1,65 @@
 # Правки по проблемным ревизиям (Auto Flow QA)
 
-Во всех перечисленных ниже штатах базовые поля имени и адреса (`DAC`, `DCS`, `DBB`, `DAG`, `DAI`, `DAK`) уже поддерживаются BarcodeGen.
+Во всех шести ревизиях базовые поля имени и адреса (`DAC`, `DCS`, `DBB`, `DAG`, `DAI`, `DAK`) уже поддерживаются BarcodeGen. Проверка показала, что проблема шире нескольких неверных строк в YAML: BFF содержит старый слой изменения данных, а exact builders пяти ревизий сами превращают пустой `DAD` в `NONE`.
 
-Основная проблема находится не в builder-ах BarcodeGen, а в старых правилах BFF для этих профилей: неполных схемах, неверных defaults, лишних шагах цепочки и фильтрации полей. Для этих штатов нужно убрать старые ограничения BFF и дать отработать новой общей Auto Flow-логике так же, как она работает для остальных ревизий.
+Главный контракт исправления:
 
-## Как сейчас работает новая логика
+> Пустое optional-поле остаётся пустым. BFF не заменяет пустоту строкой `NONE` и не придумывает пользовательские значения. `NONE` допустим только как **явно выбранное** значение закрытого списка.
+
+## Архитектурное решение
+
+Старую runtime-логику не нужно чинить, ограничивать allowlist-ами или сохранять ради совместимости — её можно полностью удалить из BFF:
+
+* удалить `ApplyEngineDefaults` и профильный раздел `defaults`;
+* удалить `applyChoiceFallbacks` из `prepare` и `generate`;
+* удалить неиспользуемый старый `CalculationChain` и state-specific ветки, дублирующие BarcodeGen;
+* не переносить эти правила в новый compatibility-layer.
+
+Неизменяемые значения формата (`QQQ="DL"`, MI `DDB="Rev 01-21-2011"`) не оправдывают сохранение универсального механизма BFF defaults: их нужно задавать явным literal-шагом новой цепочки либо внутри профиля ревизии BarcodeGen. В BFF остаются transport/auth/billing/idempotency, базовая валидация и общий `ChainExecutor`; декларативные schema, required-поля, allowlist и `generationSteps` могут описывать новый Auto Flow, но не должны содержать скрытые legacy-подстановки или state-specific вычисления.
+
+## Где сейчас появляются скрытые значения
 
 * Frontend вызывает `prepare`, получает `draftFields`, затем вызывает `generate` с `mode=prepared` (`app/pages/generating.vue`).
-* BFF запускает общий `ChainExecutor.ExecuteGrouped`: нормализует semantic-поля в AAMVA-коды и выполняет `generationSteps` профиля (`internal/usecase/prepare_usecase.go`, `chain_executor.go`). Старый `CalculationChain` в runtime уже не используется.
-* BFF вызывает internal `random`, `calculate` и `pdf417` BarcodeGen. Финальный payload собирает exact builder выбранной ревизии (`src/barcode/barcode.service.ts`, `barcode-config.service.ts`).
+* `ChainExecutor.ExecuteGrouped` сначала нормализует semantic-поля, затем вызывает `ApplyEngineDefaults` до `generationSteps` (`internal/usecase/chain_executor.go:68-70`).
+* `prepare` вызывает `applyChoiceFallbacks` после цепочки (`prepare_usecase.go:44-49`).
+* `generate` повторно вызывает `applyChoiceFallbacks` до quote (`generate_usecase.go:161-169`), а затем повторно вызывает `ApplyEngineDefaults` перед render (`generate_usecase.go:320-322`).
+* `ApplyEngineDefaults` считает `nil` и `""` отсутствующим значением. Поэтому явные `middleName=""`, `suffix=""` и `realId=""` могут быть перезаписаны.
+* После BFF финальный payload собирает exact builder выбранной ревизии (`barcode-config.service.ts`). В CA, WA, CO, LA и OH шаблон содержит `data.DAD ? data.DAD : 'NONE'`; MI — единственная из шести ревизий, где пустой middle name уже обрабатывается без `NONE`.
 
-То есть целиком удалять профиль из BFF нельзя: новой общей логике всё ещё нужны корректные `generationSteps`, константы ревизии и обязательные render-поля. Нужно удалить только старые правила, которые меняют или блокируют корректные данные.
+Следовательно, недостаточно удалить несколько YAML-строк: нужно удалить старый слой автоподстановки целиком и отдельно исправить пять exact builders.
 
-## Что убрать или исправить в BFF для всех 6 профилей
+## Инвентаризация удаляемых defaults
 
-* Удалить `DAD="NONE"` из defaults OH, WA, LA, CO и MI. Пустой `middleName` должен дойти до BarcodeGen пустым:
-  * обычные builders сами решают, писать ли `DADNONE`;
-  * в MI пустой `DAD` не добавляется в `DCT`, а BFF-default сейчас ошибочно даёт `DCT<first> NONE` и участвует в расчёте `DAQ`.
-* Удалить `DCU="NONE"` в OH и LA. Иначе непустая строка приводит к реальному полю `DCUNONE`; отсутствие suffix должно передаваться пустым.
-* Удалить `DDK="NONE"` и `DDL="NONE"` в OH, WA и LA. Перед BarcodeGen флаги нормализовать как `true → "1"`, `false → поле отсутствует`. Строки `"false"` и `"NONE"` truthy и ошибочно включают donor/veteran.
-* Удалить фиктивные defaults адреса `DAG="1 MAIN ST"`, `DAI="CITY"/"LOS ANGELES"`, `DAK="00000"/"90001"`. Если адрес обязателен для builder-а, сделать `street`, `city` и `zipCode` обязательными в форме, а не подменять их тестовыми значениями.
-* Удалить фиктивные `DAU="510"` и `DAW="150"`, если значения должны приходить из формы. `DAU="510"` особенно неверен при формате total inches: 5′10″ должно передаваться как `70`, после чего builder сформирует `070 in`.
-* Не перезаписывать явно выбранный `realId=""` значением `DDA="F"`. Сейчас и `ApplyEngineDefaults`, и choice fallback считают пустую строку отсутствующим значением. Для No Mark нужно сохранить явную пустую строку до builder-а.
-* `NONE` не удалять вслепую: для `DCB`, `DCD` и LA state-specific полей это может быть корректный литерал. Убирать нужно только неверные defaults конкретной ревизии (`DCA`, `DCB`, `DCD`, `DCL` перечислены ниже).
-* Не показывать generated-поля как пользовательский ввод. В частности, `DCJ` для WA и CO должен появляться после `prepare`, а не как `Audit Information *` на начальной форме.
-* Сначала выполнять semantic → engine normalization, затем `renderAllowlist`. Сейчас BFF сначала фильтрует поля и только потом маппит `firstName → DAC`, `lastName → DCS`, `street → DAG` и т. д. Из-за этого semantic-поля могут быть отброшены до маппинга.
-* Добавить alias `heightInches → DAU`. Сейчас BFF знает только `height → DAU`.
+Раздел `defaults` удаляется из этих BFF-профилей целиком, а не редактируется по одному полю. Ниже — инвентаризация данных, которые больше не должны материализоваться в BFF:
+
+* **CA:** `DCA`, `DCB`, `DCD`, `DBC`, `DAY`, `DAZ`, `DAU`, `DAW`, `DAG`, `DAI`, `DAK`, `QQQ`.
+* **WA:** `DAD`, `DCA`, `DCB`, `DCD`, `DBC`, `DAY`, `DAU`, `DAW`, `DAG`, `DAI`, `DAK`, `DDA`, `DDK`, `DDL`, `QQQ`.
+* **LA:** `DAD`, `DCA`, `DCB`, `DCD`, `DBC`, `DAY`, `DAU`, `DAW`, `DAG`, `DAI`, `DAK`, `DDA`, `DDK`, `DDL`, `DCU`, `QQQ`, а также `ZLA`, `ZLB`, `ZLC`, `ZLE`, `ZLF`, `ZLI` со значением `NONE`. Последние особенно опасны: LA builder видит непустой `NONE` и уже не использует свои state-extension значения.
+* **CO:** `DAD`, `DCA`, `DCB`, `DCD`, `DBC`, `DAY`, `DAZ`, `DAU`, `DAW`, `DAG`, `DAI`, `DAK`, `DDA`, `DCL`, `QQQ`.
+* **MI:** `DAD`, `DAG`, `DAI`, `DAK`, `DBC`, `DDA`, `QQQ`; revision literal `DDB` переносится под ответственность BarcodeGen.
+* **OH:** `DAD`, `DCA`, `DCB`, `DCD`, `DBC`, `DAY`, `DAZ`, `DAU`, `DAW`, `DAG`, `DAI`, `DAK`, `DDA`, `DDK`, `DDL`, `DCU`, `QQQ`.
+
+Это убирает не только `DAD/DCU/DDK`, но и тестовые адреса, рост `510`, вес `150`, цвет `BRO`, автоматический REAL ID и неверные class/restriction/race значения.
+
+## Что удалить и чем заменить
+
+1. **Полностью удалить механизм defaults.** Удалить `ApplyEngineDefaults`, поле `defaults` из модели/парсера/валидатора профиля и сами YAML-блоки. Не заменять его `constants` внутри BFF: форматные константы должны задаваться BarcodeGen по revision key.
+2. **Полностью удалить runtime fallback-ы.** Удалить `applyChoiceFallbacks` и запретить `prepare`/`generate` дописывать `fallbackValue` в request/draft. Начальное значение select — только UI-состояние, которое frontend явно отправляет. Для required closed-choice отсутствие ключа возвращает validation error; для optional closed-choice пустая строка сохраняется.
+3. **Требовать явную отправку выбранных списков.** `DCB` и `DCD` могут иметь вариант `NONE`, а WA `DCA` по проверенному контракту имеет единственный вариант `NONE`. Это значения select, а не подстановка вместо отсутствующего поля. CO `DCL` не имеет варианта `NONE`.
+4. **Сначала normalize, потом filter.** Пока semantic → AAMVA mapping остаётся в BFF, выполнять `NormalizeEngineFields(resolvedFields)` до `filterRenderValues`. Текущий порядок удаляет `firstName`, `lastName`, `street`, `city`, `zipCode` до их преобразования. В целевой архитектуре mapping также можно перенести в единый контракт BarcodeGen.
+5. **Не продолжать после ошибки `prepare`.** Frontend не должен отправлять semantic-поля как `mode=prepared`, если `prepare` завершился ошибкой.
+6. **Заменить скрытые значения обязательностью.** Поля, которые exact builder безусловно читает или форматирует (`padStart`, `padEnd`, `toString`), должны быть required в schema/`requiredRenderFields`. Отсутствие поля — явная 4xx ошибка до billing/render, а не тестовое значение.
+7. **Не показывать generated-поля как начальный ввод.** `DCJ` для WA и CO появляется после `prepare`; LA `DCJ` остаётся ручным обязательным полем.
+8. **Нормализовать boolean строго по типу.** `true → "1"`, `false/отсутствие → поле не передавать`. Строки `"false"` и `"NONE"` должны отклоняться, а не считаться truthy. Для OH builder также нужно не печатать пустые `DDK`/`DDL` теги при `false`.
+9. **Добавить alias `heightInches → DAU`.** Пока mapping остаётся в BFF, он должен знать это поле; после переноса контракта alias должен жить в BarcodeGen.
+10. **Оставить только общую orchestration.** В BFF не должно быть state-specific defaults, вычислений, compatibility fallback-ов или исправления payload. Новый общий `ChainExecutor` и декларативные `generationSteps` можно оставить: они выбирают операции BarcodeGen, но не реализуют их и не придумывают данные.
+
+## Точечные правки BarcodeGen, без которых `DADNONE` останется
+
+* В CA (`barcode-config.service.ts:174-175`), WA (`:3124`), CO (`:3714`), LA (`:4360`) и OH (`:4668`) заменить `DAD${data.DAD ? data.DAD : 'NONE'}` на сохранение пустого payload, например `DAD${data.DAD ?? ''}`. Не вставлять литерал `NONE`.
+* MI builder уже корректен: `DCT${data.DAC}${data.DAD ? ' ' + data.DAD : ''}`.
+* В CO state-extension (`:3716`) не использовать `data.DCB ? data.DCB : 'NONE'`. `DCB` должен прийти как явный выбор `NONE` или `C`; если выбора нет, запрос должен быть отклонён до builder-а.
+* Select options `NONE` в `DCB`/`DCD` не удалять. Для WA также сохранить единственный явный option `DCA=NONE`.
 
 ---
 
@@ -35,15 +69,15 @@
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
   * `suffix` (`DCU`) — `""`, `JR`, `SR`, `1ST`..`9TH`;
-  * `sex` (`DBC`) — `1` | `2`, fallback `1`;
+  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
   * `hairColor` (`DAZ`);
-  * `vehicleClass` (`DCA`) — только `D`, fallback `D`;
-  * `restrictions` (`DCB`) — `A` | `B`, fallback `A`;
+  * `vehicleClass` (`DCA`) — только `D`, начальное значение формы `D`;
+  * `restrictions` (`DCB`) — `A` | `B`, начальное значение формы `A`;
   * `endorsements` (`DCD`) — `NONE`;
-  * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`;
+  * `realId` (`DDA`) — `""` | `N` | `F`, начальное значение формы `F`;
   * `organDonor` (`DDK`) и `veteran` (`DDL`) — boolean без строкового default.
 * **Вырезать в BFF:**
   * defaults `DAD="NONE"`, `DCU="NONE"`, `DCA="C"`, `DCB="NONE"`, `DAU="510"`, `DAW="150"`, `DDK="NONE"`, `DDL="NONE"`;
@@ -55,14 +89,14 @@
 
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
-  * `sex` (`DBC`) — `1` | `2`, fallback `1`;
+  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
   * `vehicleClass` (`DCA`) — `NONE`;
   * `restrictions` (`DCB`) — `NONE` | `B`;
   * `endorsements` (`DCD`) — `NONE`;
-  * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`;
+  * `realId` (`DDA`) — `""` | `N` | `F`, начальное значение формы `F`;
   * `organDonor` (`DDK`) и `veteran` (`DDL`) — boolean без строкового default.
 * **Проверено:** автогенерация уже реализована. Если пользователь не передал свой `DCJ`, общий `prepare` выполняет:
   * `random[DAJ, DBD] → DCJ`;
@@ -85,14 +119,14 @@
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
   * `suffix` (`DCU`) — `""`, `JR`, `SR`, `1ST`..`9TH`;
-  * `sex` (`DBC`) — `1` | `2`, fallback `1`;
+  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
-  * `vehicleClass` (`DCA`) — `D` | `C` | `E`, fallback `D`;
+  * `vehicleClass` (`DCA`) — `D` | `C` | `E`, начальное значение формы `D`;
   * `restrictions` (`DCB`) — `NONE` | `C` | `01`;
   * `endorsements` (`DCD`) — `NONE`;
-  * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`;
+  * `realId` (`DDA`) — `""` | `N` | `F`, начальное значение формы `F`;
   * `organDonor` (`DDK`) и `veteran` (`DDL`) — boolean без строкового default.
 * **Вырезать в BFF:** defaults `DAD="NONE"`, `DCU="NONE"`, `DCA="C"`, `DAU="510"`, `DAW="150"`, `DDK="NONE"`, `DDL="NONE"`.
 * **Точечная правка:** проверять не только отсутствие `DCJ`, но и запрещённое значение `NONE`.
@@ -107,15 +141,15 @@
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
   * `suffix` (`DCU`) — `""`, `JR`, `SR`, `1ST`..`9TH`;
-  * `sex` (`DBC`) — `1` | `2`, fallback `1`;
+  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
   * `hairColor` (`DAZ`);
-  * `vehicleClass` (`DCA`) — `A` | `C`, fallback `C`;
+  * `vehicleClass` (`DCA`) — `A` | `C`, начальное значение формы `C`;
   * `restrictions` (`DCB`) — `NONE` | `01`;
   * `endorsements` (`DCD`) — `NONE`;
-  * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`;
+  * `realId` (`DDA`) — `""` | `N` | `F`, начальное значение формы `F`;
   * `organDonor` (`DDK`) и `veteran` (`DDL`) — boolean без строкового default.
 * **Вырезать в BFF:** defaults `DAD="NONE"`, `DCU="NONE"`, `DDK="NONE"`, `DDL="NONE"` и старые поля изображения из schema.
 * **Точечная правка:** добавить `heightInches → DAU`, иначе новое поле не попадёт в builder.
@@ -126,16 +160,16 @@
 
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
-  * `sex` (`DBC`) — `1` | `2`, fallback `1`;
+  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
   * `hairColor` (`DAZ`);
-  * `race` (`DCL`) — `AI`, `AP`, `BK`, `H`, `O`, `W`, `U`, fallback `U`;
-  * `vehicleClass` (`DCA`) — `R` | `C`, fallback `R`;
+  * `race` (`DCL`) — `AI`, `AP`, `BK`, `H`, `O`, `W`, `U`, начальное значение формы `U`;
+  * `vehicleClass` (`DCA`) — `R` | `C`, начальное значение формы `R`;
   * `restrictions` (`DCB`) — `NONE` | `C`;
   * `endorsements` (`DCD`) — `NONE` | `M`;
-  * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`. Значение участвует в генерации `DBD + DBA`.
+  * `realId` (`DDA`) — `""` | `N` | `F`, начальное значение формы `F`. Значение участвует в генерации `DBD + DBA`.
 * **Оставить новой Auto Flow-логике цепочку:** `DAQ → DBD + DBA → DCF → DCJ` в порядке, заданном рабочей логикой BarcodeGen.
 * **Вырезать в BFF:**
   * обязательный ручной ввод `auditCode/DCJ` на начальной форме;
@@ -149,8 +183,8 @@
 
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима и участвует в `DAQ`/`DCT`;
-  * `sex` (`DBC`) — `1` | `2`, fallback `1`;
-  * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`.
+  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
+  * `realId` (`DDA`) — `""` | `N` | `F`, начальное значение формы `F`.
 * Физические поля, class/restrictions/endorsements, donor и veteran не добавлять: MI builder их не использует.
 * **Проверено:** отдельную новую логику для MI писать не нужно. BarcodeGen уже содержит MI builder и нужные генераторы. Цепочка должна быть:
   * literal `DDB="Rev 01-21-2011"` — exact resolver и internal DTO уже поддерживают это значение;
@@ -169,9 +203,11 @@
 
 ## Ожидаемый результат
 
-После удаления конфликтующих state-specific правил BFF эти шесть ревизий должны проходить через тот же общий Auto Flow, что и рабочие профили:
+После полного удаления legacy execution-layer из BFF эти шесть ревизий должны проходить только через новый общий Auto Flow, как рабочие профили:
 
-`schema → prepare/ExecuteGrouped → prepared draft → exact BarcodeGen builder → render`.
+`declarative schema/generationSteps → prepare/ExecuteGrouped → prepared draft → exact BarcodeGen builder → render`.
+
+Никакого параллельного пути через defaults, runtime fallback-ы или старые state-specific расчёты после этого не остаётся.
 
 Отдельные исключения остаются только там, где этого действительно требует builder:
 
