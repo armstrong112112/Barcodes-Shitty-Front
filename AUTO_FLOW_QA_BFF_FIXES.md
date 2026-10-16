@@ -62,7 +62,7 @@
 * **Добавить в форму и маппинг:**
   * `middleName` (`DAD`) — опциональная пустая строка допустима;
   * `suffix` (`DCU`) — `""`, `JR`, `SR`, `1ST`..`9TH`;
-  * `sex` (`DBC`) — `1` | `2`, начальное значение формы `1`;
+  * `sex` (`DBC`) — `1` | `2`, н��чальное значение формы `1`;
   * `heightInches` (`DAU`);
   * `weightPounds` (`DAW`);
   * `eyeColor` (`DAY`);
@@ -205,3 +205,81 @@
 * OH — автоматический `DAX`;
 * MI — literal revision и собственный набор входов для `DAQ`/`DCK`;
 * все штаты — корректная семантика пустых optional-полей и boolean-флагов.
+
+---
+
+## Дополнительные баги в новой Auto Flow-логике
+
+Ниже — отдельные дефекты, найденные при проверке новой реализации. Они не повторяют уже описанные ошибки с порядком `NormalizeEngineFields` / `filterRenderValues` и проглатыванием ошибки `prepare`.
+
+### 1. `ChainExecutor` всё ещё может перезаписать пользовательское значение
+
+`ExecuteGrouped` создаёт `resolved = NormalizeEngineFields(baseInput)`, но при обработке output проверяет `hasUserValue(baseInput, field)` по исходной, ненормализованной карте (`chain_executor.go:68, 87-96`). Поэтому semantic-ввод не считается пользовательским значением engine-поля.
+
+Пример: пользователь передал `auditCode`, нормализация создала `DCJ`, но проверка ищет `DCJ` в исходном `baseInput` и не находит. Шаг `audit` затем бесшумно заменяет пользовательский код сгенерированным. Та же ошибка применима к `issueDate → DBD`, `expiryDate → DBA`, `documentDiscriminator → DCF` и другим alias-полям, если они являются output шага.
+
+**Исправление:** один раз создать нормализованный `userInput` до defaults и использовать его и для `resolved`, и для проверки `Skipped`. Если одновременно пришли semantic- и engine-ключ с разными непустыми значениями, не выбирать один молча, а возвращать conflict/validation error.
+
+### 2. `generatedFields` и имена полей формы находятся в разных пространствах имён
+
+`RevisionConfig.GeneratedFields()` возвращает engine-коды из `generationSteps.output`, например `DCJ`, а frontend скрывает поле через `generated.has(field.name)`, где `field.name` равен `auditCode` (`revision_config.go:63-74`, `generating.vue:92-97`). Поэтому `DCJ !== auditCode`: generated-поле WA/CO остаётся на начальной форме.
+
+Вместе с багом выше это даёт особенно опасный сценарий: UI показывает `auditCode`, пользователь его вводит, а `ChainExecutor` всё равно генерирует новый `DCJ` и перезаписывает ввод.
+
+**Исправление:** отдавать в schema generated-признак в том же namespace, что и `FieldSchema.Name`, предпочтительно явным `source: generated`. Альтернатива — единый публичный alias-registry, используемый и BFF, и frontend; локальные несвязанные списки недопустимы.
+
+### 3. Частичный override пары дат создаёт непроверенную смешанную пару
+
+`runStep` сначала генерирует и валидирует полную пару `[DBD, DBA]`, а только потом `ExecuteGrouped` отдельно пропускает каждый output, который считает пользовательским (`chain_executor.go:79-98, 105-137`). Если пользователь передал только `DBD` или только `DBA`, финальный draft собирается из одной пользовательской и одной сгенерированной даты. Валидатор проверял другую — полностью сгенерированную — пару.
+
+В `auto` финальная смешанная пара больше не проверяется: `validatePreparedDates` вызывается только для точного `mode=prepared` (`generate_usecase.go:329-334`). В результате expiration может оказаться не позже фактического issue date.
+
+**Исправление:** считать date-step атомарным. Либо пользователь передаёт обе даты, и BFF валидирует именно их, либо BarcodeGen генерирует обе. Частичный override должен быть отклонён. Финальную пару нужно валидировать во всех режимах перед Billing.
+
+### 4. Native `Derive` теряет revision и нарушает атомарность grouped-step
+
+`HTTPClient.Derive(ctx, revision, ...)` игнорирует аргумент `revision` и вызывает `Random/Calculate` с пустой строкой (`http_client.go:176-198`). При этом `native` — режим по умолчанию (`config.go:174`). Выбор state/revision в BarcodeGen становится невозможным или зависит от случайного содержимого input.
+
+Кроме того, native `Derive` выполняет отдельный HTTP-вызов для каждого output. Значит, заявленный grouped date-step `[DBD, DBA]` фактически берёт `DBD` из одного random-вызова, а `DBA` из другого. Валидатор может принять календарно допустимую, но не атомарно сгенерированную пару.
+
+**Исправление:** как минимум передавать реальный `revision` в каждый вызов. Для `[DBD, DBA]` использовать одну grouped-ручку BarcodeGen; если native-контракт её не поддерживает, этот adapter не должен использоваться для Auto Flow как эквивалент grouped derive.
+
+### 5. `supportedModes` не применяется к `generate`
+
+`prepare` проверяет capability через `supportsMode`, а `GenerateUseCase.Execute` — нет. Любая строка, кроме точного `"prepared"`, считается auto (`generate_usecase.go:223`), а финальная проверка prepared-дат выполняется только при точном совпадении (`:330`).
+
+Следствия:
+
+* опечатка вроде `preapred` неожиданно запускает derive-цепочку;
+* LA и MI принимают `mode=auto`, хотя их профили объявляют только `[prepare, prepared]`;
+* неизвестный mode обходит prepared-only ветку валидации.
+
+**Исправление:** до quote разрешать только `auto` и `prepared`, затем проверять выбранный mode по `cfg.SupportedModes`. Пустой mode можно явно нормализовать в `auto`, но не трактовать любую неизвестную строку как auto.
+
+### 6. `schema.fields[].required` не является серверной обязательностью
+
+BFF проверяет только `requiredInputFields` и `requiredRenderFields`; флаг `FieldSchema.Required` нигде не участвует в серверной валидации (`generate_usecase.go:899-913`). Например, в текущем CA-профиле `eyeColor` отмечен `required: true`, но отсутствует и в `requiredInputFields`, и в `requiredRenderFields`. Сейчас это маскирует default `DAY=BRO`; после удаления defaults поле сможет исчезнуть без явного 4xx и дойти до builder-а пустым/`undefined`.
+
+**Исправление:** профиль должен иметь один исполняемый required-контракт. После normalize и до quote/Billing BFF обязан проверить все обязательные пользовательские и render-поля. UI-флаг `required` не должен расходиться с runtime-валидацией.
+
+### 7. Billing блокируется до финальной валидации payload
+
+`Billing.Block` выполняется на `generate_usecase.go:298-309`, а `NormalizeEngineFields`, `requiredRenderFields`, проверка prepared-дат и `applyRenderTransforms` — только после него (`:314-340`). При любой из этих ошибок usecase сразу возвращается и не вызывает `Billing.Release`; компенсация начинается только после попыток render (`:357-369`).
+
+Это особенно проявляется в уже найденном fallback-сценарии: `prepare` упал, frontend отправил неполный `prepared`, BFF заблокировал средства и лишь затем обнаружил отсутствующий `DCJ` или даты.
+
+**Исправление:** все детерминированные преобразования и проверки выполнять до `Billing.Block`. Дополнительно после успешного Block должен быть единый compensating guard, который делает Release при любом раннем выходе до Capture.
+
+### 8. Frontend удаляет явно пустые optional-поля ещё до `prepare`
+
+`buildFields()` пропускает любое значение `raw === ""` (`generating.vue:154-161`). Поэтому `middleName=""`, `suffix=""`, `realId=""` не пересекают границу frontend → BFF как осознанный пользовательский выбор. BFF не может отличить «пользователь оставил пустым» от «поле не пришло» и применяет default/fallback.
+
+**Исправление:** передавать явную пустую строку для optional string/enum, где пустота является допустимым бизнес-значением. Состояния «не трогал» и «явно очистил» должны различаться контрактом, а не схлопываться удалением ключа.
+
+### 9. Frontend не задаёт `buildId`/`batchId`, хотя BFF строит из них billing saga
+
+`generating.vue` вызывает `service.generate` без `buildId` и `batchId`; service отправляет их как `undefined`, то есть ключи исчезают из JSON (`barcodeGeneration.service.ts:120-128`). BFF не требует эти поля и строит `sagaID = saga-<userID>-<buildID>-<batchID>` (`generate_usecase.go:242-246`). Для всех обычных генераций одного пользователя получается одинаковый `saga-<userID>--`.
+
+Следствие — независимые генерации могут конфликтовать в Billing и попадать в одну business saga, несмотря на разные `X-Idempotency-Key`.
+
+**Исправление:** frontend должен создавать стабильные `buildId` и `batchId` один раз на пользовательское действие. BFF обязан либо требовать оба идентификатора, либо детерминированно выводить отсутствующий ID из `userID + X-Idempotency-Key`; пустые идентификаторы нельзя допускать до Block.
