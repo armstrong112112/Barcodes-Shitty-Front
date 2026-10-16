@@ -70,16 +70,18 @@
   * `endorsements` (`DCD`) — `NONE`;
   * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`;
   * `organDonor` (`DDK`) и `veteran` (`DDL`) — boolean без строкового default.
-* **Оставить новой Auto Flow-логике цепочку:**
-  * `DAQ`;
-  * `DBD + DBA`;
+* **Проверено:** автогенерация уже реализована. Если пользователь не передал свой `DCJ`, общий `prepare` выполняет:
   * `random[DAJ, DBD] → DCJ`;
   * `calculate[DAJ, DAQ, DCJ] → DCF`.
-* **Вырезать в BFF:**
-  * обязательный ручной ввод `auditCode/DCJ` на начальной форме;
-  * шаг `DCK` — WA builder его не использует;
-  * defaults `DAD="NONE"`, `DCA="C"`, `DAU="510"`, `DAW="150"`, `DDK="NONE"`, `DDL="NONE"`.
-* **Исправить сборку payload:** не добавлять отдельный WA-костыль для переносов. Сначала исправить общий порядок `NormalizeEngineFields → renderAllowlist`: именно ранняя фильтрация может выбрасывать `DCS`, `DAG`, `DAI` и `DAK` до их преобразования в AAMVA-коды.
+
+  Переписывать эту логику не нужно — нужно дать ей полностью отработать.
+* **Вырезать блокеры в BFF:**
+  * убрать `auditCode/DCJ` из обязательных полей начальной формы; `requiredRenderFields: [DCJ]` оставить, потому что после `prepare` поле уже должно быть заполнено;
+  * удалить шаг `DCK` из `generationSteps` — WA builder его не использует;
+  * удалить defaults `DAD="NONE"`, `DCA="C"`, `DAU="510"`, `DAW="150"`, `DDK="NONE"`, `DDL="NONE"`.
+* **По сломанному `DCS` и адресу:** в WA-builder переносы между `DCS`, `DAG`, `DAI`, `DAJ` и `DAK` уже стоят правильно. Вероятная причина находится в fallback-пути BFF: frontend проглатывает ошибку `prepare` и отправляет semantic-поля как `prepared`, а BFF применяет `renderAllowlist` раньше `NormalizeEngineFields`. Из-за этого `lastName`, `street`, `city` и `zipCode` могут быть отброшены до преобразования в `DCS`, `DAG`, `DAI`, `DAK`.
+
+  Исправление: выполнять `NormalizeEngineFields` до `renderAllowlist` и не продолжать `prepared`-генерацию после ошибки `prepare`. Отдельный WA-костыль для переносов не нужен.
 
 ---
 
@@ -156,17 +158,18 @@
   * `sex` (`DBC`) — `1` | `2`, fallback `1`;
   * `realId` (`DDA`) — `""` | `N` | `F`, fallback `F`.
 * Физические поля, class/restrictions/endorsements, donor и veteran не добавлять: MI builder их не использует.
-* **Оставить новой Auto Flow-логике цепочку:**
-  * literal `DDB="Rev 01-21-2011"`;
+* **Проверено:** отдельную новую логику для MI писать не нужно. BarcodeGen уже содержит MI builder и нужные генераторы. Цепочка должна быть:
+  * literal `DDB="Rev 01-21-2011"` — exact resolver и internal DTO уже поддерживают это значение;
   * `random[DAJ, DAC, DAD, DCS, DBB] → DAQ`;
   * `random[DAJ, DBB, DDB, DDA] → DBD + DBA`;
   * `calculate[DAJ, DAQ, DBB, DBA] → DCK`;
-  * отдельный `DCF` не вызывать.
-* **Вырезать в BFF:**
-  * default `DAD="NONE"`, иначе builder формирует `DCT<first> NONE`;
-  * старый сокращённый вызов `DAQ` только с `[DAJ]`;
-  * общий набор входов `DCK`, который требует `DBD` для всех штатов.
-* **Точечная правка:** сделать валидацию `DCK` profile-aware для MI, потому что MI-цепочка не должна требовать `DBD`.
+  * отдельный `DCF` не вызывать — MI builder его не использует, и в текущем профиле такого шага уже нет.
+* **Вырезать блокеры в BFF:**
+  * удалить default `DAD="NONE"`, иначе builder формирует `DCT<first> NONE`, а `DAQ` рассчитывается с искусственным middle name;
+  * заменить сокращённый шаг `DAQ` с input `[DAJ]` на `[DAJ, DAC, DAD, DCS, DBB]`;
+  * передавать в шаг дат полный набор `[DAJ, DBB, DDB, DDA]`;
+  * убрать `DBD` из MI input для `DCK`.
+* **Одна точечная правка в BarcodeGen:** общий guard операции `DCK` сейчас требует `DBD` для всех штатов, хотя MI helper использует только `DAQ`, `DBB` и `DBA`. Сделать этот guard profile-aware для MI. После этого новой общей Auto Flow-логике достаточно дать выполнить цепочку без дополнительных MI-костылей.
 
 ---
 
