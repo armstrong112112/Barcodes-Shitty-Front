@@ -7,12 +7,12 @@
 Пользователь:
 
 1. выбирает страну, штат, ревизию и тип документа;
-2. получает полную форму выбранной ревизии;
-3. заполняет все поля вручную;
-4. при желании нажимает `Random` или `Calculate` возле отдельного поля;
+2. получает полную semantic-форму выбранного exact-профиля;
+3. вручную заполняет базовые данные человека;
+4. при желании нажимает `Random` или `Calculate` только возле разрешённого generated/calculated поля;
 5. может исправить любой полученный результат;
 6. нажимает финальную кнопку;
-7. BFF проверяет полный payload и вызывает render.
+7. BFF проверяет полный semantic payload, внутри маппит его в AAMVA и вызывает render.
 
 Главное отличие от Auto Flow:
 
@@ -26,12 +26,12 @@ Auto:
 base fields → BFF сам выполняет action 1 → action 2 → action 3 → render
 
 Prepared:
-полная форма
-  → пользователь нажал Random у DAQ
-  → пользователь нажал Random у DBD+DBA
-  → пользователь нажал Calculate у DCK
+полная semantic-форма
+  → пользователь нажал Random у documentNumber
+  → пользователь нажал Random у issueDate+expirationDate
+  → пользователь нажал Calculate у inventoryNumber
   → пользователь всё проверил и отредактировал
-  → render без скрытых actions
+  → BFF маппит draft в engine fields и делает render без скрытых actions
 ```
 
 ## 2. Откуда берётся логика
@@ -72,21 +72,43 @@ Prepared:
 - `barcode_gen/src/barcode/barcode.controller.ts` — schema, random, calculate и render routes;
 - `barcode_gen/src/barcode/dto/get-data.dto.ts` — контекст формы;
 - `barcode_gen/src/barcode-config/helper/present-fields.helper.ts` — полная форма `top + down[type]` при `flag=false`;
-- `barcode_gen/src/barcode-config/helper/config.helper.ts:92-198` — общие actions имени, DOB и адреса в `topFields()`;
+- `barcode_gen/src/barcode-config/helper/config.helper.ts:92-198` — в legacy metadata действительно объявлены random handlers для имени, DOB и адреса;
 - `barcode_gen/src/barcode-config/barcode-config.service.ts` — поля, options, `randomHandler`, `calculateHandler` и builders ревизий;
 - например, CA DL находится в `barcode-config.service.ts:42-192`: `DAQ` random, grouped dates, `DBA`, `DCK` и `DCF` calculate handlers записаны возле самих полей.
 
+Наличие handler в legacy metadata не означает автоматическое включение его в новый публичный BFF-контракт. В принятом BFF flow базовые данные человека не генерируются: handlers имени, DOB и адреса остаются legacy-only. В Prepared публикуются только утверждённые действия для номера документа, дат выдачи/окончания и служебных идентификаторов exact-профиля.
+
 ### 2.3. BFF
 
-В BFF уже есть нужные части Auto Flow:
+В BFF уже есть части Auto Flow:
 
 - `internal/usecase/chain_executor.go` — выполнение grouped random/calculate;
-- `generate_usecase.go` — разделение `auto` и `prepared`;
+- `generate_usecase.go` — текущее разделение `auto` и `prepared`;
+- `internal/domain/engine_fields.go` — semantic → AAMVA mapping;
 - `internal/adapters/barcodegen/legacy/client.go` — public BarcodeGen adapter;
 - `internal/adapters/barcodegen/legacy/internal_client.go` — grouped derive и internal render;
 - `app/pages/generating.vue` — текущий frontend-вызов prepare/generate.
 
-Prepared переиспользует адаптеры и правила валидации, но не `ChainExecutor`. Вместо длинной автоматической цепи BFF хранит набор коротких разрешённых actions выбранного профиля.
+### 2.4. Что подтверждено текущим кодом, а что ещё целевое
+
+На момент проверки реальный flow такой:
+
+1. `GET /api/v1/revisions/:revision/schema` отдаёт static BFF schema с semantic names (`firstName`, `lastName`, `dateOfBirth`); query `mode=prepared` сейчас handler-ом не используется.
+2. Frontend хранит значения по `field.name`, отправляет semantic base input в `prepare`, получает draft и затем отправляет его в `generate(mode="prepared")`.
+3. `prepare` и Auto используют `ChainExecutor`; он сначала делает semantic → AAMVA normalization, поэтому возвращаемый `draftFields` фактически смешанный: в нём остаются public keys и появляются engine keys.
+4. Текущий frontend работает именно потому, что финально отправляет этот mixed draft из `prepare`, а не чистый semantic prepared payload.
+5. В `generate_usecase.go` `filterRenderValues` сейчас вызывается **до** `NormalizeEngineFields`. Поэтому прямой `generate(mode="prepared")` с чистыми semantic keys может потерять их на engine allowlist и не является надёжно реализованным путём.
+6. `GenerateRequest.Fields` пока является свободным `map[string]any`. `NormalizeEngineFields` сохраняет уже присланные raw keys, поэтому текущая реализация не обеспечивает обещанное строгое `400` для каждого внешнего AAMVA key.
+7. Raw-only payload тоже не является корректным публичным контрактом: `requiredInputFields` проверяются по semantic names. Например, один `DAC` не удовлетворяет обязательному `firstName`. Иными словами, фактический mixed payload — переходный implementation leak, а не контракт, который нужно закрепить.
+8. `POST /api/v1/barcode/action`, Prepared schema с action metadata и per-action validation сейчас отсутствуют; это целевые изменения этого ТЗ.
+9. В текущем `generate_usecase.go` условие записано как `mode != "prepared"`; его нужно заменить exact switch по разделу 8, чтобы неизвестный mode не запускал Auto.
+
+Итоговая граница после реализации этого ТЗ:
+
+- frontend и публичные BFF endpoints используют только semantic keys;
+- AAMVA-коды разрешены только внутри BFF registry/adapters и на внутренней границе BFF → BarcodeGen;
+- raw AAMVA key во внешнем `fields` или `values` отклоняется до Billing с `400 VALIDATION_ERROR`;
+- Prepared переиспользует адаптеры и правила валидации, но один клик не запускает `ChainExecutor`: BFF выполняет ровно один разрешённый action exact-профиля.
 
 ## 3. Два режима, а не три
 
@@ -116,7 +138,9 @@ Frontend обращается только к BFF:
 GET /api/v1/revisions/US_CA_08292017/schema?mode=prepared&country=USA&type=DL
 ```
 
-BFF получает полную форму BarcodeGen:
+Production BFF не получает форму из BarcodeGen на каждый пользовательский запрос. Полная semantic schema, mappings, options, constants и action registry хранятся в version-controlled exact-profile BFF config — это тот же источник, который уже использует текущий `GET /api/v1/revisions/:revision/schema`.
+
+BarcodeGen metadata используется только при миграционном offline-аудите и compatibility tests:
 
 ```http
 POST /api/v1/barcodes
@@ -133,29 +157,37 @@ Content-Type: application/json
 }
 ```
 
-`flag=false` важен: он возвращает `top + down[type]`. При `flag=true` общие поля имени, адреса и даты рождения могут потеряться.
+`flag=false` важен для аудита: он возвращает `top + down[type]`. BFF переводит `abr` в semantic name при подготовке checked-in profile; raw `abr` не публикуется frontend как ключ формы.
 
-### 4.1. Что BFF сохраняет без потерь
+### 4.1. Что BFF хранит в exact-profile config
 
-Для каждого поля:
+Для каждого публичного поля:
 
-- `abr` → `code`;
-- `title` → `label`;
-- `type`;
-- `value` или `selected`;
-- полный список `values`;
-- `pattern`;
+- semantic `name`;
+- человекочитаемый `label`;
+- semantic `type` и UI `control`;
+- `required`, `fallbackValue`;
+- полный typed список `options`;
+- validation rules;
 - исходную группу и порядок;
-- разрешённый короткий action из exact-profile registry.
+- разрешённый короткий semantic action, если это generated/calculated field.
+
+AAMVA mapping, server-owned `DAJ/DDB/QQQ` и точные downstream dependencies хранятся в той же конфигурации, но не выдаются клиенту как редактируемые поля.
 
 ```ts
 type PreparedField = {
-  code: string
+  name: string
   label: string
-  type: "input" | "calendar" | "select" | "choiser" | "radio" | "icon"
-  initialValue?: string | number
-  options?: Array<{ label: string; value: string | number }>
-  pattern?: string
+  type: "string" | "date" | "enum" | "number" | "boolean"
+  control: "input" | "calendar" | "select" | "radio" | "toggle"
+  required: boolean
+  fallbackValue?: string | number | boolean
+  options?: Array<{ label: string; value: string | number | boolean }>
+  validation?: {
+    minLength?: number
+    maxLength?: number
+    pattern?: string
+  }
   position: number
   action?: PreparedAction
 }
@@ -170,7 +202,7 @@ type PreparedAction = {
 
 ### 4.2. Пример ответа BFF на schema
 
-Ниже сокращён `fields`, чтобы показать несколько profile-specific actions. В реальном ответе в `fields` присутствует каждый код из `expectedCodes`.
+Ниже сокращён `fields`, чтобы показать несколько profile-specific actions. В реальном ответе присутствует каждое semantic field из `expectedFields`. Server-owned profile constants в `expectedFields` не входят.
 
 ```json
 {
@@ -178,74 +210,86 @@ type PreparedAction = {
   "mode": "prepared",
   "context": {
     "country": "USA",
-    "DAJ": "CA",
-    "DDB": "08292017",
-    "QQQ": "DL"
+    "state": "CA",
+    "revision": "08292017",
+    "documentType": "DL"
   },
-  "expectedCodes": ["DAJ", "DDB", "QQQ", "DAC", "DAD", "DCS", "DCU", "DBB", "DAG", "DAI", "DAK", "DBC", "DDA", "DAQ", "DBD", "DBA", "DCK", "DCF", "DCA", "DCB", "DCD", "DAU", "DAW", "DAY", "DAZ", "DDK", "DDL"],
+  "expectedFields": [
+    "firstName", "middleName", "lastName", "suffix", "dateOfBirth",
+    "street", "city", "postalCode", "sex", "realId",
+    "documentNumber", "issueDate", "expirationDate", "inventoryNumber",
+    "documentDiscriminator", "vehicleClass", "restrictions", "endorsements",
+    "heightInches", "weightPounds", "eyeColor", "hairColor",
+    "organDonor", "veteran"
+  ],
   "fields": [
     {
-      "code": "DAQ",
+      "name": "documentNumber",
       "label": "Customer ID Number",
-      "type": "input",
+      "type": "string",
+      "control": "input",
       "action": {
-        "id": "random:DAQ",
+        "id": "random:documentNumber",
         "type": "random",
-        "inputFields": ["DAJ"],
-        "outputFields": ["DAQ"]
+        "inputFields": [],
+        "outputFields": ["documentNumber"]
       }
     },
     {
-      "code": "DBD",
+      "name": "issueDate",
       "label": "Issue Date",
-      "type": "calendar",
+      "type": "date",
+      "control": "calendar",
       "action": {
-        "id": "random:DBD+DBA",
+        "id": "random:documentDates",
         "type": "random",
-        "inputFields": ["DAJ", "DBB", "DDB", "DDA"],
-        "outputFields": ["DBD", "DBA"]
+        "inputFields": ["dateOfBirth", "realId"],
+        "outputFields": ["issueDate", "expirationDate"]
       }
     },
     {
-      "code": "DCK",
+      "name": "inventoryNumber",
       "label": "Inventory Control Number",
-      "type": "input",
+      "type": "string",
+      "control": "input",
       "action": {
-        "id": "calculate:DCK",
+        "id": "calculate:inventoryNumber",
         "type": "calculate",
-        "inputFields": ["DAJ", "DBD", "DAQ"],
-        "outputFields": ["DCK"]
+        "inputFields": ["issueDate", "documentNumber"],
+        "outputFields": ["inventoryNumber"]
       }
     }
   ]
 }
 ```
 
-Это целевой ответ BFF. Frontend не разбирает исходный `randomHandler` сам и не отправляет произвольные зависимости.
+Это целевой публичный ответ BFF. Frontend не видит AAMVA dependencies, не разбирает исходный `randomHandler` и не отправляет произвольные inputs/outputs. Например, для California BFF сам добавляет внутренние `DAJ=CA`, `DDB=08292017`, `QQQ=DL`, затем маппит `issueDate → DBD` и `documentNumber → DAQ`.
 
 ### 4.3. Зачем хранить actions в BFF
 
-Полная форма приходит из BarcodeGen, но разрешённые actions сохраняются в version-controlled exact-profile registry BFF.
+Полная форма и разрешённые actions сохраняются в version-controlled exact-profile registry BFF.
 
 Причины:
 
-1. Auto и Prepared используют одни и те же проверенные зависимости.
+1. Auto и Prepared используют одни и те же проверенные внутренние dependencies.
 2. Frontend не может подменить inputs или outputs.
-3. Каждая кнопка имеет короткое и понятное правило.
-4. Можно сравнивать registry с `randomHandler/calculateHandler` BarcodeGen и ловить расхождение до релиза.
-5. Не нужен отдельный длинный Prepared-chain.
+3. Каждая кнопка имеет короткое и понятное semantic правило.
+4. Compatibility tests сравнивают registry с `randomHandler/calculateHandler` BarcodeGen и ловят расхождение до релиза.
+5. Не нужен runtime metadata call и отдельный длинный Prepared-chain.
 
-Если live schema BarcodeGen и сохранённый action не совпали, BFF не угадывает правило и не выполняет action. Он возвращает ошибку конфигурации.
+Если compatibility fixture и сохранённый action не совпали, deployment/test должен завершиться ошибкой. Production BFF не угадывает правило по live metadata.
 
 ## 5. Состояние формы
 
-Frontend хранит одну карту:
+Frontend хранит одну semantic-карту:
 
 ```ts
+type PreparedValue = string | number | boolean
+
 type PreparedFormState = {
   profileId: string
-  expectedCodes: string[]
-  values: Record<string, string | number>
+  expectedFields: string[]
+  values: Record<string, PreparedValue>
 }
 ```
 
@@ -253,27 +297,27 @@ type PreparedFormState = {
 
 ```json
 {
-  "DAJ": "CA",
-  "DDB": "08292017",
-  "QQQ": "DL",
-  "DAC": "JOHN",
-  "DAD": "",
-  "DCS": "SMITH",
-  "DBB": "07191994",
-  "DAQ": "",
-  "DBD": "",
-  "DBA": "",
-  "DCK": "",
-  "DCF": ""
+  "firstName": "JOHN",
+  "middleName": "",
+  "lastName": "SMITH",
+  "dateOfBirth": "07191994",
+  "documentNumber": "",
+  "issueDate": "",
+  "expirationDate": "",
+  "inventoryNumber": "",
+  "documentDiscriminator": ""
 }
 ```
 
+`state`, revision и document type не дублируются в редактируемой карте: BFF восстанавливает их из `profileId` и отклоняет попытку подменить их через `fields`/`values`.
+
 Правила:
 
-- каждый `expectedCode` должен существовать в карте;
-- `""` и `0` не удаляются как falsy;
+- каждый `expectedField` должен быть известен exact-profile schema; обязательность задаётся отдельно через `required`;
+- raw AAMVA keys (`DAC`, `DAQ`, `DCK`, `Z*` и другие) во внешней карте запрещены;
+- `""`, `0` и `false` не удаляются как falsy;
 - пользователь может заполнить action-поле вручную;
-- successful action меняет только свои `outputFields`;
+- successful action меняет только свои semantic `outputFields`;
 - ошибка action не очищает старое значение;
 - после action результат остаётся редактируемым;
 - смена страны, штата, ревизии или типа создаёт новую форму;
@@ -281,7 +325,7 @@ type PreparedFormState = {
 
 ## 6. Нажатие отдельной кнопки
 
-Frontend отправляет только `actionId` и текущие значения. Списки inputs/outputs берутся из BFF registry, а не доверяются клиенту.
+Frontend отправляет только semantic `actionId` и текущие semantic значения. Списки inputs/outputs и server-owned context берутся из BFF registry, а не доверяются клиенту.
 
 ```http
 POST /api/v1/barcode/action
@@ -291,34 +335,33 @@ Content-Type: application/json
 ```json
 {
   "profileId": "US_CA_08292017",
-  "documentType": "DL",
-  "actionId": "calculate:DCK",
+  "actionId": "calculate:inventoryNumber",
   "values": {
-    "DAJ": "CA",
-    "DBD": "04162023",
-    "DAQ": "A1234567"
+    "issueDate": "04162023",
+    "documentNumber": "A1234567"
   }
 }
 ```
 
 BFF:
 
-1. находит exact profile;
+1. находит exact profile по `profileId`;
 2. находит сохранённый action по `actionId`;
-3. проверяет, что все его inputs присутствуют и валидны;
-4. берёт только разрешённые inputs;
-5. вызывает random или calculate adapter;
-6. принимает только объявленные outputs;
-7. возвращает маленький patch формы.
+3. отклоняет raw AAMVA и неизвестные semantic keys;
+4. проверяет, что все semantic inputs присутствуют и валидны;
+5. добавляет server-owned profile context и маппит разрешённые inputs в engine keys;
+6. вызывает random или calculate adapter;
+7. принимает только объявленные engine outputs;
+8. маппит их обратно в semantic names и возвращает маленький patch формы.
 
 ### 6.1. Успешный ответ BFF
 
 ```json
 {
   "success": true,
-  "actionId": "calculate:DCK",
+  "actionId": "calculate:inventoryNumber",
   "values": {
-    "DCK": "23106A12345670401"
+    "inventoryNumber": "23106A12345670401"
   }
 }
 ```
@@ -326,7 +369,7 @@ BFF:
 Frontend делает:
 
 ```text
-form.values.DCK = response.values.DCK
+form.values.inventoryNumber = response.values.inventoryNumber
 ```
 
 Он не заменяет весь draft ответом BFF.
@@ -338,10 +381,10 @@ form.values.DCK = response.values.DCK
   "success": false,
   "error": {
     "code": "ACTION_INPUT_MISSING",
-    "message": "Заполните поля, необходимые для расчёта DCK",
+    "message": "Заполните поля, необходимые для расчёта inventory number",
     "fields": [
-      { "code": "DBD", "label": "Issue Date" },
-      { "code": "DAQ", "label": "Customer ID Number" }
+      { "name": "issueDate", "label": "Issue Date" },
+      { "name": "documentNumber", "label": "Customer ID Number" }
     ]
   }
 }
@@ -349,38 +392,26 @@ form.values.DCK = response.values.DCK
 
 HTTP: `422`.
 
-### 6.3. Нельзя подменить action
+### 6.3. Нельзя подменить action или прислать raw key
 
-Если клиент прислал неизвестный `actionId`:
+Неизвестный `actionId` возвращает `422 ACTION_NOT_ALLOWED`. Любой AAMVA key во внешнем `values`, например `DAQ`, возвращает `400 VALIDATION_ERROR` до вызова adapter-а.
 
-```json
-{
-  "success": false,
-  "error": {
-    "code": "ACTION_NOT_ALLOWED",
-    "message": "Это действие недоступно для выбранной ревизии"
-  }
-}
-```
+### 6.4. Даты `issueDate + expirationDate`
 
-HTTP: `422`.
-
-### 6.4. Даты `DBD + DBA`
-
-`random:DBD+DBA` — одно действие и один ответ:
+`random:documentDates` — одно действие и один semantic-ответ:
 
 ```json
 {
   "success": true,
-  "actionId": "random:DBD+DBA",
+  "actionId": "random:documentDates",
   "values": {
-    "DBD": "04162023",
-    "DBA": "07192028"
+    "issueDate": "04162023",
+    "expirationDate": "07192028"
   }
 }
 ```
 
-BFF применяет правила `ISS_DBD_FLOW.md`:
+Внутри adapter работает с `DBD + DBA`, но эти ключи не пересекают публичную BFF-границу. BFF применяет правила `ISS_DBD_FLOW.md`:
 
 - обе даты проверяются вместе;
 - невалидная пара отбрасывается целиком;
@@ -389,37 +420,18 @@ BFF применяет правила `ISS_DBD_FLOW.md`:
 - после десятой ошибки прежние значения формы сохраняются;
 - Billing и render при action не вызываются.
 
-### 6.5. Ещё три коротких примера
+### 6.5. Ещё два коротких примера
 
-**Случайное имя — один клик меняет три поля:**
-
-```json
-{
-  "profileId": "US_CA_08292017",
-  "actionId": "random:DAC+DAD+DCS",
-  "values": { "DBC": 1 }
-}
-```
-
-```json
-{
-  "success": true,
-  "actionId": "random:DAC+DAD+DCS",
-  "values": { "DAC": "JOHN", "DAD": "MICHAEL", "DCS": "SMITH" }
-}
-```
-
-**Kentucky DAQ — кнопка недоступна без DBD:**
+**Kentucky document number — кнопка недоступна без issue date:**
 
 ```json
 {
   "profileId": "US_KY_08312018",
-  "actionId": "random:DAQ",
+  "actionId": "random:documentNumber",
   "values": {
-    "DAJ": "KY",
-    "DBB": "07191994",
-    "DCS": "SMITH",
-    "DBD": "04162023"
+    "dateOfBirth": "07191994",
+    "lastName": "SMITH",
+    "issueDate": "04162023"
   }
 }
 ```
@@ -427,39 +439,44 @@ BFF применяет правила `ISS_DBD_FLOW.md`:
 ```json
 {
   "success": true,
-  "actionId": "random:DAQ",
-  "values": { "DAQ": "S12345678" }
+  "actionId": "random:documentNumber",
+  "values": { "documentNumber": "S12345678" }
 }
 ```
+
+BFF сам добавляет `DAJ=KY` из профиля и внутри маппит semantic inputs/outputs.
 
 **Washington — два явных клика, а не автопродолжение:**
 
 ```text
-клик 1: random:DCJ      [DAJ] → [DCJ]
-клик 2: calculate:DCF   [DAJ, DAQ, DCJ] → [DCF]
+клик 1: random:auditCode
+клик 2: calculate:documentDiscriminator
 ```
 
-После первого ответа BFF frontend только записывает `DCJ` и разблокирует вторую кнопку.
+После первого ответа BFF frontend только записывает `auditCode` и разблокирует вторую кнопку. Внутреннее правило registry при этом остаётся `[DAJ] → [DCJ]`, затем `[DAJ, DAQ, DCJ] → [DCF]`.
 
 ## 7. Короткие actions по всем ревизиям
 
-Формат ниже:
+Матрица ниже является **внутренней engine-матрицей BFF**, поэтому намеренно использует AAMVA-коды:
 
 ```text
-поле — random/calculate: [что взять] → [что вернуть]
+engine field — random/calculate: [engine inputs] → [engine outputs]
 ```
 
-Это не автоматическая цепочка. Каждая строка — отдельная кнопка. Порядок определяется только наличием inputs.
+Публичная schema и action API переводят её в semantic names. Основные соответствия action ID:
 
-Базовые поля можно заполнить вручную. Кроме этого, `topFields()` BarcodeGen задаёт три общих legacy-actions для всех 55 профилей:
+- `DAQ` → `random:documentNumber`;
+- `DBD + DBA` → `random:documentDates`;
+- отдельный `DBA` → `calculate:expirationDate`;
+- `DCK` → `calculate:inventoryNumber`;
+- `DCF` → `calculate:documentDiscriminator`;
+- `DCJ` → `random:auditCode`.
 
-- `DAC + DAD + DCS` — random: `[DBC] → [DAC, DAD, DCS]`;
-- `DBB` — random: `[] → [DBB]`;
-- `DAG + DAI + DAK` — random: `[DAJ] → [DAG, DAI, DAK]`.
+Это не автоматическая цепочка. Каждая строка — отдельная кнопка. Порядок определяется только наличием semantic inputs после исключения server-owned context.
 
-Они тоже запускаются только кнопкой и заменяют всю указанную группу атомарно. Физические данные и option-поля остаются ручными.
+Базовые данные человека заполняются только вручную. Хотя `topFields()` BarcodeGen действительно объявляет legacy random handlers для `DAC + DAD + DCS`, `DBB` и `DAG + DAI + DAK`, BFF не включает их в Prepared registry и не отдаёт для них `field.action`. Это осознанное правило продукта, а не отсутствие capability в BarcodeGen.
 
-Ниже перечислены profile-specific actions. Для grouped dates BFF хранит полный проверяемый контекст `[DAJ, DBB, DDB, DDA]`; adapter передаёт BarcodeGen поддерживаемый handler input. Для `DBA` отдельно сохранён его `calculateHandler`: обычно `[DAJ, DBB, DBD] → [DBA]`; исключения указаны прямо в профиле.
+Ниже перечислены только разрешённые profile-specific actions. Для grouped dates BFF хранит полный engine context `[DAJ, DBB, DDB, DDA]`; frontend передаёт только semantic `dateOfBirth` и `realId`, а `DAJ/DDB` BFF восстанавливает из exact profile. Для `DBA` отдельно сохранён его `calculateHandler`: обычно `[DAJ, DBB, DBD] → [DBA]`; исключения указаны прямо в профиле.
 
 ### 1. California DL — `US_CA_08292017`
 
@@ -930,48 +947,46 @@ Content-Type: application/json
   "units": 1,
   "confirmed": true,
   "fields": {
-    "DAJ": "CA",
-    "DDB": "08292017",
-    "QQQ": "DL",
-    "DAC": "JOHN",
-    "DAD": "",
-    "DCS": "SMITH",
-    "DCU": "",
-    "DBB": "07191994",
-    "DAG": "123 MAIN ST",
-    "DAI": "LOS ANGELES",
-    "DAK": "90001",
-    "DBC": 1,
-    "DDA": "F",
-    "DAQ": "A1234567",
-    "DBD": "04162023",
-    "DBA": "07192028",
-    "DCK": "23106A12345670401",
-    "DCF": "04/16/2023ABCDE/1234/28",
-    "DCA": "C",
-    "DCB": "NONE",
-    "DCD": "NONE",
-    "DAU": "70",
-    "DAW": "180",
-    "DAY": "BRO",
-    "DAZ": "BRO",
-    "DDK": 0,
-    "DDL": 0
+    "firstName": "JOHN",
+    "middleName": "",
+    "lastName": "SMITH",
+    "suffix": "",
+    "dateOfBirth": "07191994",
+    "street": "123 MAIN ST",
+    "city": "LOS ANGELES",
+    "postalCode": "90001",
+    "sex": 1,
+    "realId": "F",
+    "documentNumber": "A1234567",
+    "issueDate": "04162023",
+    "expirationDate": "07192028",
+    "inventoryNumber": "23106A12345670401",
+    "documentDiscriminator": "04/16/2023ABCDE/1234/28",
+    "vehicleClass": "C",
+    "restrictions": "NONE",
+    "endorsements": "NONE",
+    "heightInches": 70,
+    "weightPounds": 180,
+    "eyeColor": "BRO",
+    "hairColor": "BRO",
+    "organDonor": false,
+    "veteran": false
   }
 }
 ```
 
 BFF в ветке `prepared`:
 
-1. загружает exact profile и актуальную полную форму;
-2. проверяет контекст `DAJ/DDB/QQQ`;
-3. проверяет наличие всех `expectedCodes`;
-4. отклоняет неизвестные поля;
-5. проверяет options, pattern, даты и profile-specific правила;
-6. не запускает ни одного action;
-7. только после validation вызывает Billing Block;
-8. вызывает internal PDF417 render;
-9. делает Capture при успехе или Release при ошибке.
+1. загружает immutable exact profile из BFF registry;
+2. проверяет, что `fields` содержит только semantic names текущего профиля;
+3. отклоняет raw AAMVA, server-owned и неизвестные поля;
+4. проверяет обязательность, options, pattern, даты и profile-specific правила;
+5. не запускает ни одного action;
+6. маппит semantic draft в allowlisted engine fields;
+7. сам подставляет неизменяемые `DAJ/DDB/QQQ` и profile constants;
+8. только после полной validation вызывает Quote/Billing Block;
+9. вызывает internal PDF417 render;
+10. делает Capture при успехе или Release при ошибке.
 
 Псевдокод целевого ветвления:
 
@@ -1010,10 +1025,10 @@ default:
   "success": false,
   "error": {
     "code": "INCOMPLETE_PREPARED_PAYLOAD",
-    "message": "Заполните все поля выбранной ревизии",
+    "message": "Заполните обязательные поля выбранной ревизии",
     "fields": [
-      { "code": "DCK", "label": "Inventory Control Number" },
-      { "code": "DCF", "label": "Document Discriminator" }
+      { "name": "inventoryNumber", "label": "Inventory Control Number" },
+      { "name": "documentDiscriminator", "label": "Document Discriminator" }
     ]
   }
 }
@@ -1028,10 +1043,10 @@ HTTP: `422`. До Billing и BarcodeGen render запрос не доходит.
   "success": false,
   "error": {
     "code": "PREPARED_FIELD_INVALID",
-    "message": "Поле DCA содержит недопустимое значение",
+    "message": "Поле vehicleClass содержит недопустимое значение",
     "fields": [
       {
-        "code": "DCA",
+        "name": "vehicleClass",
         "label": "Vehicle Class",
         "value": "X"
       }
@@ -1042,33 +1057,41 @@ HTTP: `422`. До Billing и BarcodeGen render запрос не доходит.
 
 HTTP: `422`.
 
+### 8.4. Raw AAMVA key во внешнем payload
+
+Если клиент прислал, например, `"DAQ": "A1234567"` вместо `"documentNumber": "A1234567"`, BFF отвечает `400 VALIDATION_ERROR` с `details.unknownFields=["DAQ"]`. Запрос не доходит до Quote, Billing, helper или render.
+
 ## 9. Что изменить в BFF и frontend
 
 ### 9.1. BFF
 
 1. Не добавлять `mode=standard`; использовать `mode=prepared`.
-2. Для Prepared schema получать полную форму BarcodeGen с `flag=false`.
-3. Хранить exact-profile registry коротких actions из раздела 7.
-4. Отдавать action рядом с конкретным полем в schema response.
-5. Добавить `POST /api/v1/barcode/action`.
-6. В action request доверять только `profileId`, `actionId` и текущим values; dependencies брать из registry.
-7. Переиспользовать random/calculate adapters Auto Flow, но не `ChainExecutor`.
-8. В `generate_usecase.go` запускать executor только для exact `mode=auto`.
-9. Для `mode=prepared` использовать полный пользовательский payload без повторной генерации.
-10. Все ошибки Prepared validation возвращать до Billing.
+2. Расширить static exact-profile schema BFF до полной Prepared-формы; BarcodeGen `flag=false` использовать в offline compatibility tests, а не как runtime source of truth.
+3. Зафиксировать один canonical semantic vocabulary (`documentNumber`, `postalCode`, `heightInches` и т. д.) и убрать публичные конкурирующие aliases (`idNumber`/`dlNumber`, `zipCode`, `height`).
+4. Хранить semantic schema, внутренние AAMVA mappings и exact-profile registry коротких actions из раздела 7 в одном профиле.
+5. Не включать legacy handlers имени, DOB и адреса в Prepared registry.
+6. Отдавать semantic action рядом только с generated/calculated полем в schema response.
+7. Добавить `POST /api/v1/barcode/action`.
+8. В action request доверять только `profileId`, semantic `actionId` и semantic `values`; engine dependencies и context брать из registry.
+9. До adapter-а отклонять raw AAMVA/server-owned/unknown keys с `400 VALIDATION_ERROR`.
+10. Переиспользовать random/calculate adapters Auto Flow, но не запускать `ChainExecutor` для одного Prepared action.
+11. В `generate_usecase.go` запускать executor только для exact `mode=auto`; неизвестный mode отклонять.
+12. Для `mode=prepared` валидировать полный semantic payload и маппить его в engine keys **до** применения engine `renderAllowlist`.
+13. После mapping строить внутренний allowlisted engine payload без повторной генерации; mixed draft больше не нужен и не возвращается клиенту.
+14. Все ошибки Prepared validation возвращать до Quote/Billing.
 
 ### 9.2. Frontend
 
-1. Рендерить все поля Prepared schema.
-2. Хранить значения в одной карте по AAMVA-кодам.
-3. Показывать кнопку только при наличии `field.action`.
-4. Disable кнопки, пока не заполнены её inputs.
-5. По клику отправлять один `actionId`.
-6. Применять только `response.values` как patch.
+1. Рендерить все semantic поля Prepared schema.
+2. Хранить значения в одной карте по semantic names; AAMVA-коды не использовать в состоянии формы и HTTP payload.
+3. Показывать кнопку только при наличии `field.action`; базовые поля человека actions не имеют.
+4. Disable кнопки, пока не заполнены её semantic inputs.
+5. По клику отправлять один semantic `actionId`.
+6. Применять только semantic `response.values` как patch.
 7. Не запускать следующую кнопку автоматически.
 8. Предупреждать перед заменой уже заполненных outputs.
 9. Разрешать ручное редактирование после action.
-10. Финально отправлять `mode=prepared` и полный fields object.
+10. Финально отправлять `mode=prepared` и полный semantic `fields` object.
 
 ## 10. Проверки
 
@@ -1076,14 +1099,18 @@ HTTP: `422`.
 
 Для каждого из 55 профилей:
 
-- schema содержит правильные короткие actions;
-- action inputs и outputs точно совпадают с разделом 7;
+- публичная schema содержит только canonical semantic field names;
+- schema содержит правильные короткие semantic actions;
+- внутренние engine inputs/outputs точно совпадают с разделом 7;
 - неизвестный action отклоняется;
-- лишний input не отправляется downstream;
-- неожиданный output не применяется;
+- raw AAMVA key в action/generate request отклоняется с `400 VALIDATION_ERROR` до внешних вызовов;
+- server-owned `DAJ/DDB/QQQ` нельзя подменить через frontend payload;
+- лишний semantic input не отправляется downstream;
+- неожиданный engine output не применяется;
+- actions имени, DOB и адреса отсутствуют во всех Prepared schemas;
 - action не вызывает Billing или render;
 - final Prepared Generate не вызывает random/calculate;
-- пустые `""` и числовые `0` не теряются.
+- `""`, `0` и `false` не теряются.
 
 ### 10.2. Особые fixtures
 
@@ -1105,17 +1132,21 @@ HTTP: `422`.
 ## 11. Критерии приёмки
 
 1. В системе остаются только `auto` и `prepared`.
-2. Prepared показывает полную форму exact revision.
-3. Пользователь может заполнить всю форму без actions.
-4. Для каждого generated/calculated поля показывается только сохранённый exact-profile action.
-5. Нажатие выполняет только один action.
-6. Следующий action не запускается автоматически.
-7. BFF не доверяет присланным клиентом dependencies.
-8. Ответ action содержит только patch `values`.
-9. Ошибка action не очищает форму.
-10. `DBD + DBA` генерируются и применяются атомарно.
-11. После action любое output-поле остаётся редактируемым.
-12. Финальный `mode=prepared` не вызывает `prepare`, `ChainExecutor`, random или calculate.
-13. Полнота и валидация проверяются до Billing.
-14. Все 55 профилей покрыты contract tests.
-15. ON/AB не получают выдуманные US helper rules.
+2. Prepared показывает полную semantic-форму exact revision.
+3. Frontend хранит и отправляет только canonical semantic keys; AAMVA существует только внутри BFF/BarcodeGen.
+4. Raw AAMVA или server-owned key во внешнем payload отклоняется до Billing.
+5. Пользователь может заполнить всю форму без actions.
+6. Имя, DOB и адрес не имеют actions и никогда не генерируются BFF.
+7. Для каждого generated/calculated поля показывается только сохранённый exact-profile action.
+8. Нажатие выполняет только один action.
+9. Следующий action не запускается автоматически.
+10. BFF не доверяет присланным клиентом dependencies.
+11. Ответ action содержит только semantic patch `values`.
+12. Ошибка action не очищает форму.
+13. `issueDate + expirationDate` (`DBD + DBA` внутри) генерируются и применяются атомарно.
+14. После action любое output-поле остаётся редактируемым.
+15. Финальный `mode=prepared` не вызывает `prepare`, `ChainExecutor`, random или calculate.
+16. Полнота и валидация проверяются до Quote/Billing.
+17. Неизвестный `mode` не попадает в Auto Flow.
+18. Все 55 профилей покрыты contract tests.
+19. ON/AB не получают выдуманные US helper rules.
