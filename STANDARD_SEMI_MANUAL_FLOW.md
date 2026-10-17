@@ -1,73 +1,125 @@
-# ТЗ: основной полуручной флоу генерации баркода
+# ТЗ: основной Prepared / Regular flow генерации баркода
 
-## 1. Назначение и источник бизнес-логики
+## 1. Коротко
 
-Этот документ описывает **основной Standard / Regular flow**. Это не полностью автоматический Light flow и не «голый» Advanced-редактор произвольных ключей.
+Этот flow — нормально сделанный `prepared`, а не отдельный третий режим.
 
-Источник состава формы — не YAML-профили BFF, а фактический state/revision/document-type контракт `BarcodeGen`:
+Пользователь:
 
-- `barcode_gen/src/barcode/barcode.controller.ts` — `POST /api/v1/barcodes`;
-- `barcode_gen/src/barcode/dto/get-data.dto.ts` — контекст `{country, DAJ, DDB, type, flag}`;
-- `barcode_gen/src/barcode-config/helper/present-fields.helper.ts` — при `flag=false` возвращает полный набор `top + down[type]`;
-- `barcode_gen/src/barcode-config/barcode-config.service.ts` — реальные поля, options, `randomHandler`, `calculateHandler` и exact builder каждой ревизии.
+1. выбирает страну, штат, ревизию и тип документа;
+2. получает полную форму выбранной ревизии;
+3. заполняет все поля вручную;
+4. при желании нажимает `Random` или `Calculate` возле отдельного поля;
+5. может исправить любой полученный результат;
+6. нажимает финальную кнопку;
+7. BFF проверяет полный payload и вызывает render.
 
-Флоу:
+Главное отличие от Auto Flow:
 
-1. пользователь выбирает страну, штат, ревизию и тип документа;
-2. BFF запрашивает у `BarcodeGen` **полную** форму выбранного профиля с `flag=false`;
-3. фронт отображает все поля из ответа, не заменяя их сокращённой BFF-схемой;
-4. пользователь обязан передать значение для **каждого `abr` из полученной формы**;
-5. значение может быть введено вручную либо получено по явному нажатию `Random`/`Calculate`;
-6. ручные и полученные значения хранятся в одной AAMVA-карте;
-7. финальная кнопка отправляет полный снимок этой карты без скрытой догенерации.
+- Auto сам выполняет всю последовательность действий;
+- Prepared хранит те же короткие действия, но выполняет только одно действие после явного клика пользователя;
+- результат одного действия может разблокировать следующую кнопку, но не запускает её;
+- финальная кнопка Prepared не вызывает `random`, `calculate`, `prepare` или `ChainExecutor`.
 
-Главный принцип:
+```text
+Auto:
+base fields → BFF сам выполняет action 1 → action 2 → action 3 → render
 
-> `BarcodeGen` определяет полный payload конкретного штата и ревизии, а пользователь предоставляет его целиком. BFF не подменяет отсутствующие значения defaults, fallback-ами или `ChainExecutor` и не сокращает state-specific контракт до generic YAML-схемы.
+Prepared:
+полная форма
+  → пользователь нажал Random у DAQ
+  → пользователь нажал Random у DBD+DBA
+  → пользователь нажал Calculate у DCK
+  → пользователь всё проверил и отредактировал
+  → render без скрытых actions
+```
 
-«Полный payload» означает полноту ключей, а не обязательную непустую строку у каждого поля. Если профиль допускает пустое значение, пользователь всё равно отправляет ключ с явным `""` или `0`; отсутствие ключа считается неполным payload. Поля формы `BarcodeGen` используют string/number, поэтому визуальные boolean-переключатели сериализуются в точное числовое значение схемы (`0`/`1`) ещё во frontend.
+## 2. Откуда берётся логика
 
-Правила генерации пары `DBD + DBA` согласуются с `ISS_DBD_FLOW.md`, но применяются только при явном нажатии пользователем кнопки генерации пары.
+### 2.1. Проверенный legacy flow
 
----
+Старый frontend уже работал как полуручной редактор:
 
-## 2. Отличие от Auto Flow
+- `barcodes/stateGet.php:454-637` читает `randomHandler` и `calculateHandler`, собирает зависимости и создаёт отдельные кнопки Generate;
+- `barcodes/getRandom.php` передаёт текущие входы в старый random endpoint;
+- `barcodes/getCalculate.php`, `getCalculate2.php`, `getCalculate3.php` делают то же для отдельных calculate-полей;
+- `barcodes/genBar.php:76-88` хранит одну карту значений `$Msearch`;
+- `barcodes/genBar.php:91-115` получает схему и находит поля `DBD`, `DAQ`, `DCF`, `DCK`;
+- `barcodes/genBar.php:519-521` отправляет итоговую карту в render.
 
-### Auto Flow / Light
+Полезная логика legacy:
 
-Пользователь видит сокращённую анкету. Служебные поля (`DAQ`, `DBD`, `DBA`, `DCK`, `DCF`, `DCJ`) скрыты, а BFF сам исполняет разрешённую цепочку `random/calculate`.
+```text
+схема поля
+  → список входов
+  → список выходов
+  → отдельная кнопка
+  → ответ записывается в поля формы
+```
 
-### Standard / Regular — основной режим
+Не переносим:
 
-Пользователь видит **весь** набор полей, который `POST /api/v1/barcodes` вернул для выбранных `DAJ + DDB + QQQ`: общие `top`-поля и state-specific `down[type]`. Каждое поле документа остаётся редактируемым, кроме уже выбранных полей контекста, которые показываются read-only.
+- ручную склейку JSON;
+- строки вида `DAJ/CA,DBB/07191994`;
+- поиск значений через DOM;
+- PHP-прокси для каждого поля;
+- старые URL и загрузку PNG на диск PHP-сервером.
 
-Для каждого поля пользователь сам решает, откуда взять значение:
+### 2.2. BarcodeGen
 
-- ввести вручную;
-- явно выбрать пустой option, если он есть в схеме;
-- подтвердить или изменить начальное значение формы;
-- нажать `Random` или `Calculate`, если действие описано схемой;
-- исправить руками результат действия.
+Источники состава формы и действий:
 
-Но пользователь не решает, исключать ли поле из запроса: каждый `abr` полной формы должен присутствовать в финальной карте. Финальная кнопка **не вызывает `ChainExecutor`, не достраивает отсутствующие поля и не отправляет неполную карту**.
+- `barcode_gen/src/barcode/barcode.controller.ts` — schema, random, calculate и render routes;
+- `barcode_gen/src/barcode/dto/get-data.dto.ts` — контекст формы;
+- `barcode_gen/src/barcode-config/helper/present-fields.helper.ts` — полная форма `top + down[type]` при `flag=false`;
+- `barcode_gen/src/barcode-config/helper/config.helper.ts:92-198` — общие actions имени, DOB и адреса в `topFields()`;
+- `barcode_gen/src/barcode-config/barcode-config.service.ts` — поля, options, `randomHandler`, `calculateHandler` и builders ревизий;
+- например, CA DL находится в `barcode-config.service.ts:42-192`: `DAQ` random, grouped dates, `DBA`, `DCK` и `DCF` calculate handlers записаны возле самих полей.
 
----
+### 2.3. BFF
 
-## 3. Шаг 1 — выбор контекста и получение полной формы
+В BFF уже есть нужные части Auto Flow:
 
-Контекст документа состоит из:
+- `internal/usecase/chain_executor.go` — выполнение grouped random/calculate;
+- `generate_usecase.go` — разделение `auto` и `prepared`;
+- `internal/adapters/barcodegen/legacy/client.go` — public BarcodeGen adapter;
+- `internal/adapters/barcodegen/legacy/internal_client.go` — grouped derive и internal render;
+- `app/pages/generating.vue` — текущий frontend-вызов prepare/generate.
 
-- страны;
-- штата или региона (`DAJ`);
-- ревизии (`DDB`);
-- типа документа (`QQQ`: `DL` или `ID`);
-- режима `standard`.
+Prepared переиспользует адаптеры и правила валидации, но не `ChainExecutor`. Вместо длинной автоматической цепи BFF хранит набор коротких разрешённых actions выбранного профиля.
 
-Фронт обращается только к BFF. Существующий frontend уже вызывает `GET /api/v1/revisions/{revision}/schema`, поэтому эту BFF-ручку нужно сделать адаптером реального контракта, а не YAML-источником. Для Standard BFF разбирает revision key, принимает `country` и `type` query-параметрами и вызывает:
+## 3. Два режима, а не три
+
+| Этап | `auto` | `prepared` |
+|---|---|---|
+| Форма | сокращённая | полная форма ревизии |
+| Служебные поля | обычно скрыты | видимы и редактируемы |
+| Random/Calculate | BFF запускает сам | только после клика пользователя |
+| Следующий action | запускается executor-ом | только разблокируется в UI |
+| Ручное изменение результата | через draft | в любой момент в форме |
+| Финальная кнопка | выполняет chain и render | только validation, Billing и render |
+
+Отдельный `mode=standard` не нужен. В публичном контракте остаются:
+
+```text
+mode=auto
+mode=prepared
+```
+
+`POST /api/v1/barcode/prepare` может оставаться частью Auto Flow. Новый ручной Prepared flow не обязан вызывать `prepare`: пользователь уже готовит полный draft в форме.
+
+## 4. Получение полной Prepared-формы
+
+Frontend обращается только к BFF:
+
+```http
+GET /api/v1/revisions/US_CA_08292017/schema?mode=prepared&country=USA&type=DL
+```
+
+BFF получает полную форму BarcodeGen:
 
 ```http
 POST /api/v1/barcodes
-Authorization: Bearer <service JWT>
 Content-Type: application/json
 ```
 
@@ -81,38 +133,23 @@ Content-Type: application/json
 }
 ```
 
-Полный путь следует из `main.ts` (`api/v1`) и `BarcodeController` (`barcodes`). Путь `/api/barcodes` без `/v1` неверен.
+`flag=false` важен: он возвращает `top + down[type]`. При `flag=true` общие поля имени, адреса и даты рождения могут потеряться.
 
-`flag=false` обязателен именно для Standard: `PresentFields.fields()` возвращает `top + down[type]`. `flag=true` возвращает только `down[type]` и поэтому теряет общие имя, адрес, дату рождения и другие части полного пользовательского payload.
+### 4.1. Что BFF сохраняет без потерь
 
-### 3.1. Что нужно изменить в BFF
-
-Сейчас `GET /api/v1/revisions/:revision/schema` читает `configs/revisions/*.yaml` через `RevisionSchemaStore`. Эти generic YAML-схемы не являются источником полного Standard payload и могут расходиться с exact builder `BarcodeGen`.
-
-Нужно:
-
-1. добавить отдельный порт чтения формы `BarcodeGen`, например `BarcodeFormClient.GetFields(ctx, country, state, revision, documentType, full=true)`;
-2. реализовать его в `internal/adapters/barcodegen/legacy/client.go` вызовом `POST /api/v1/barcodes`; `InternalClient` уже встраивает `LegacyClient`, поэтому тот же метод доступен и при `BARCODEGEN_MODE=internal`;
-3. в `APIHandler.GetRevisionSchema` для `mode=standard` использовать этот порт вместо YAML `RevisionSchemaStore`;
-4. оставить YAML-профили только для Auto orchestration, пока они нужны Auto Flow, но не смешивать их поля/defaults со Standard-формой;
-5. не кэшировать форму только по BFF revision key: ключ кэша должен включать как минимум `country + DAJ + DDB + QQQ` и версию контракта.
-
-### 3.2. Lossless-нормализация ответа
-
-Ответ `BarcodeGen` является вложенным массивом рядов и групп. BFF может распрямить его для frontend, но обязан без потерь сохранить:
+Для каждого поля:
 
 - `abr` → `code`;
 - `title` → `label`;
 - `type`;
-- `value` / `selected` как начальное UI-значение;
-- полный `values` для `select`, `choiser` и `radio`;
+- `value` или `selected`;
+- полный список `values`;
 - `pattern`;
-- `random` + `randomHandler`;
-- `calculate` + `calculateHandler`;
-- исходный порядок и группу поля.
+- исходную группу и порядок;
+- разрешённый короткий action из exact-profile registry.
 
 ```ts
-type StandardField = {
+type PreparedField = {
   code: string
   label: string
   type: "input" | "calendar" | "select" | "choiser" | "radio" | "icon"
@@ -120,164 +157,142 @@ type StandardField = {
   options?: Array<{ label: string; value: string | number }>
   pattern?: string
   position: number
-  random?: DependencyAction
-  calculate?: DependencyAction
+  action?: PreparedAction
 }
 
-type DependencyAction = {
+type PreparedAction = {
+  id: string
+  type: "random" | "calculate"
   inputFields: string[]
   outputFields: string[]
 }
 ```
 
-В текущем `BarcodeGen` нет достоверного `required` на каждом поле: `fields.dto.ts` такого свойства не содержит, а `ValuesDto` почти все поля отмечает optional. Поэтому BFF не должен выдавать выдуманный `required`. Контракт полноты Standard проще и строже: **каждый `code`, который присутствует в полной форме, должен присутствовать в пользовательском payload**; допустимость пустого значения определяется options/валидацией самого поля.
+### 4.2. Пример ответа BFF на schema
 
-Например, handler:
-
-```json
-{
-  "DAJ,DBB": ["DBD", "DBA"]
-}
-```
-
-нормализуется в:
+Ниже сокращён `fields`, чтобы показать несколько profile-specific actions. В реальном ответе в `fields` присутствует каждый код из `expectedCodes`.
 
 ```json
 {
-  "inputFields": ["DAJ", "DBB"],
-  "outputFields": ["DBD", "DBA"]
+  "profileId": "US_CA_08292017",
+  "mode": "prepared",
+  "context": {
+    "country": "USA",
+    "DAJ": "CA",
+    "DDB": "08292017",
+    "QQQ": "DL"
+  },
+  "expectedCodes": ["DAJ", "DDB", "QQQ", "DAC", "DAD", "DCS", "DCU", "DBB", "DAG", "DAI", "DAK", "DBC", "DDA", "DAQ", "DBD", "DBA", "DCK", "DCF", "DCA", "DCB", "DCD", "DAU", "DAW", "DAY", "DAZ", "DDK", "DDL"],
+  "fields": [
+    {
+      "code": "DAQ",
+      "label": "Customer ID Number",
+      "type": "input",
+      "action": {
+        "id": "random:DAQ",
+        "type": "random",
+        "inputFields": ["DAJ"],
+        "outputFields": ["DAQ"]
+      }
+    },
+    {
+      "code": "DBD",
+      "label": "Issue Date",
+      "type": "calendar",
+      "action": {
+        "id": "random:DBD+DBA",
+        "type": "random",
+        "inputFields": ["DAJ", "DBB", "DDB", "DDA"],
+        "outputFields": ["DBD", "DBA"]
+      }
+    },
+    {
+      "code": "DCK",
+      "label": "Inventory Control Number",
+      "type": "input",
+      "action": {
+        "id": "calculate:DCK",
+        "type": "calculate",
+        "inputFields": ["DAJ", "DBD", "DAQ"],
+        "outputFields": ["DCK"]
+      }
+    }
+  ]
 }
 ```
 
-Все имена полей и действий находятся в одном namespace — AAMVA-коды (`DBD`, `DBA`, `DCJ`), без alias вроде `issueDate` или `auditCode`.
+Это целевой ответ BFF. Frontend не разбирает исходный `randomHandler` сам и не отправляет произвольные зависимости.
 
-### 3.3. Контекст тоже вводит пользователь
+### 4.3. Зачем хранить actions в BFF
 
-`DAJ`, `DDB` и `QQQ` не являются BFF-defaults. Пользователь выбирает их на первом шаге; затем они фиксируются в состоянии формы как read-only и входят в полный финальный payload. BFF может проверить их соответствие revision key, но не должен молча инжектировать отсутствующие значения.
+Полная форма приходит из BarcodeGen, но разрешённые actions сохраняются в version-controlled exact-profile registry BFF.
 
-При смене любой части контекста:
+Причины:
 
-1. отменяются или помечаются устаревшими незавершённые действия;
-2. запрашивается новая полная форма;
-3. создаётся новая карта со всеми кодами новой формы;
-4. значения прежней ревизии не переносятся молча;
-5. ответы от старого контекста не применяются к новой форме.
+1. Auto и Prepared используют одни и те же проверенные зависимости.
+2. Frontend не может подменить inputs или outputs.
+3. Каждая кнопка имеет короткое и понятное правило.
+4. Можно сравнивать registry с `randomHandler/calculateHandler` BarcodeGen и ловить расхождение до релиза.
+5. Не нужен отдельный длинный Prepared-chain.
 
----
+Если live schema BarcodeGen и сохранённый action не совпали, BFF не угадывает правило и не выполняет action. Он возвращает ошибку конфигурации.
 
-## 4. Шаг 2 — полуручная форма Standard / Regular
+## 5. Состояние формы
 
-Фронт хранит полную форму и единую карту значений:
+Frontend хранит одну карту:
 
 ```ts
-type StandardFormState = {
+type PreparedFormState = {
+  profileId: string
   expectedCodes: string[]
   values: Record<string, string | number>
 }
 ```
 
-`expectedCodes` формируется из всех уникальных `abr/code` ответа `POST /api/v1/barcodes` при `flag=false`. `values` с момента создания формы содержит каждый такой ключ. Ключами являются только AAMVA-коды; отдельные локальные карты semantic-name → engine-name не используются.
-
-Перед финальной отправкой frontend проверяет равенство множеств:
-
-```ts
-missing = expectedCodes.filter(code => !Object.hasOwn(values, code))
-```
-
-Значение `""` или `0` означает «пользователь явно передал значение» и не попадает в `missing`.
-
-### 4.1. Порядок полей
-
-Из старого `Regular`-режима сохраняется понятный порядок основных полей:
-
-1. имя: `DAC`, `DCS`, `DAD`;
-2. адрес: `DAG`, `DAH`, `DAI`, `DAK`;
-3. даты: `DBB`, `DBD`, `DBA`;
-4. номера: `DAQ`, `DCK`, `DCF`, `DCJ`;
-5. признаки: `DDA`, `DDK`, `DDL`;
-6. классификация: `DBC`, `DCA`, `DCB`, `DCD`, `DCL`;
-7. физические данные: `DAU`, `DAW`, `DAY`, `DAZ`;
-8. остальные поля, реально присутствующие в выбранной ревизии.
-
-Это **порядок представления**, а не хардкод состава документа. Поле показывается только тогда, когда его `abr` вернул `BarcodeGen` для выбранного контекста. Отдельный Standard-профиль BFF не может добавлять или удалять поля. Дубликаты `abr` из вложенной структуры ответа объединяются без потери первого положения и метаданных.
-
-### 4.2. Компоненты
-
-- `input` — свободный текстовый ввод;
-- `calendar` — календарь с возможностью ручного ввода;
-- `select`, `choiser`, `radio` — выбор значения из `options`;
-- `icon` — переключатель с сохранением точного контрактного значения.
-
-`pattern` из схемы можно применять как валидацию текущего поля, но нельзя добавлять новые блокирующие бизнес-правила, которых нет в фактическом контракте `BarcodeGen`.
-
-### 4.3. Начальные значения, подтверждение и явная пустота
-
-`value`/`selected` из ответа `BarcodeGen` используется только для инициализации UI. Это не серверный fallback: значение попадает в финальную карту потому, что пользователь увидел и подтвердил форму, а не потому, что BFF дописал его перед render.
-
-Нужно различать:
-
-- ключ отсутствует — payload неполный и не отправляется в Billing/render;
-- `""` — пользователь явно выбрал допустимую пустую строку;
-- `0` — пользователь явно выключил numeric-флаг или выбрал нулевое значение;
-- `1` — пользователь явно включил numeric-флаг.
-
-Нельзя удалять `""` или `0` общей проверкой falsy, заменять их строкой `NONE` либо повторно применять `fallbackValue`. В частности, пустой `DAD` должен пересечь обе границы frontend → BFF → BarcodeGen как `""`, если именно пустое значение выбрано пользователем.
-
-Для `select`/`choiser` с единственным вариантом (`NONE`, `D`, `A` и т. п.) frontend может выбрать этот option в UI, но всё равно отправляет его как часть пользовательской карты. BFF не материализует этот вариант при отсутствии ключа.
-
----
-
-## 5. Шаг 3 — явные действия `Random` и `Calculate`
-
-Кнопка показывается только для действия, которое реально описано текущей схемой.
-
-Примеры:
-
-- `DAQ`, `DBD`, `DCJ` — `Random`;
-- `DBA`, `DCK`, `DCF` — `Calculate`.
-
-Это не фоновые шаги. Получение одного результата может сделать доступной следующую кнопку, но **не запускает её автоматически**.
-
-### 5.1. Проверка зависимостей
-
-Перед запросом фронт берёт `inputFields` действия и проверяет наличие их текущих значений.
-
-Явная пустая строка считается значением только для поля, которому схема разрешает пустоту. Нельзя глобально считать только `DAD` исключением или, наоборот, считать любую пустую строку отсутствующим значением.
-
-Если входов не хватает:
-
-1. запрос не отправляется;
-2. недостающие поля подсвечиваются;
-3. показывается сообщение с label и AAMVA-кодом.
-
 Пример:
 
-> Не хватает данных для расчёта Inventory Control Number (DCK). Заполните Issue Date (DBD) и Customer ID Number (DAQ).
+```json
+{
+  "DAJ": "CA",
+  "DDB": "08292017",
+  "QQQ": "DL",
+  "DAC": "JOHN",
+  "DAD": "",
+  "DCS": "SMITH",
+  "DBB": "07191994",
+  "DAQ": "",
+  "DBD": "",
+  "DBA": "",
+  "DCK": "",
+  "DCF": ""
+}
+```
 
-BFF повторяет проверку по актуальной серверной схеме. Frontend-проверка нужна для UX, но не является границей доверия.
+Правила:
 
-### 5.2. Выполнение действия и реальный BFF-gap
+- каждый `expectedCode` должен существовать в карте;
+- `""` и `0` не удаляются как falsy;
+- пользователь может заполнить action-поле вручную;
+- successful action меняет только свои `outputFields`;
+- ошибка action не очищает старое значение;
+- после action результат остаётся редактируемым;
+- смена страны, штата, ревизии или типа создаёт новую форму;
+- ответ старого запроса не применяется к новой форме.
 
-В BFF передаются:
+## 6. Нажатие отдельной кнопки
 
-- неизменяемый контекст документа;
-- тип действия `random` или `calculate`;
-- точный список `inputFields` и `outputFields` из полученной формы;
-- снимок текущих значений входов.
-
-В текущем BFF нет пользовательской ручки для одиночного Standard-action: `ChainExecutor` доступен только внутри `prepare/generate`. Поэтому нужно добавить, например:
+Frontend отправляет только `actionId` и текущие значения. Списки inputs/outputs берутся из BFF registry, а не доверяются клиенту.
 
 ```http
 POST /api/v1/barcode/action
+Content-Type: application/json
 ```
 
 ```json
 {
-  "revision": "US_CA_08292017",
+  "profileId": "US_CA_08292017",
   "documentType": "DL",
-  "action": "calculate",
-  "inputFields": ["DAJ", "DBD", "DAQ"],
-  "outputFields": ["DCK"],
+  "actionId": "calculate:DCK",
   "values": {
     "DAJ": "CA",
     "DBD": "04162023",
@@ -286,140 +301,624 @@ POST /api/v1/barcode/action
 }
 ```
 
-BFF загружает актуальную полную форму для этого же контекста и проверяет точное совпадение action с её `randomHandler`/`calculateHandler`. Фронт не может запросить произвольный output или подменить зависимости.
+BFF:
 
-В production-режиме `BARCODEGEN_MODE=internal` BFF вызывает уже существующий grouped-контракт:
+1. находит exact profile;
+2. находит сохранённый action по `actionId`;
+3. проверяет, что все его inputs присутствуют и валидны;
+4. берёт только разрешённые inputs;
+5. вызывает random или calculate adapter;
+6. принимает только объявленные outputs;
+7. возвращает маленький patch формы.
 
-```http
-POST /api/internal/v1/barcodes/calculate
-X-Service-Token: <service token>
-Content-Type: application/json
-```
+### 6.1. Успешный ответ BFF
 
 ```json
 {
-  "input": {
-    "DAJ": "CA",
+  "success": true,
+  "actionId": "calculate:DCK",
+  "values": {
+    "DCK": "23106A12345670401"
+  }
+}
+```
+
+Frontend делает:
+
+```text
+form.values.DCK = response.values.DCK
+```
+
+Он не заменяет весь draft ответом BFF.
+
+### 6.2. Не хватает зависимостей
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ACTION_INPUT_MISSING",
+    "message": "Заполните поля, необходимые для расчёта DCK",
+    "fields": [
+      { "code": "DBD", "label": "Issue Date" },
+      { "code": "DAQ", "label": "Customer ID Number" }
+    ]
+  }
+}
+```
+
+HTTP: `422`.
+
+### 6.3. Нельзя подменить action
+
+Если клиент прислал неизвестный `actionId`:
+
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ACTION_NOT_ALLOWED",
+    "message": "Это действие недоступно для выбранной ревизии"
+  }
+}
+```
+
+HTTP: `422`.
+
+### 6.4. Даты `DBD + DBA`
+
+`random:DBD+DBA` — одно действие и один ответ:
+
+```json
+{
+  "success": true,
+  "actionId": "random:DBD+DBA",
+  "values": {
     "DBD": "04162023",
-    "DAQ": "A1234567"
-  },
-  "outputs": ["DCK"]
+    "DBA": "07192028"
+  }
 }
 ```
 
-Ответ имеет вид `{"values":{"DCK":"..."}}`. Это уже реализовано в `barcode_gen/src/internal/internal.controller.ts`, `InternalCalculateDto` и BFF `internal/adapters/barcodegen/legacy/internal_client.go` (`Derive`). Для legacy/public режима используется `POST /api/v1/barcodes/calculate` с ключом `output` в единственном числе; преобразование контрактов остаётся внутри BFF-адаптера, а не во frontend.
+BFF применяет правила `ISS_DBD_FLOW.md`:
 
-### 5.3. Применение ответа без потери ручного ввода
+- обе даты проверяются вместе;
+- невалидная пара отбрасывается целиком;
+- максимум 10 попыток;
+- успешная пара возвращается атомарно;
+- после десятой ошибки прежние значения формы сохраняются;
+- Billing и render при action не вызываются.
 
-Результат применяется только после успешного ответа и только к объявленным `outputFields`.
+### 6.5. Ещё три коротких примера
 
-Правила:
-
-1. несвязанные поля формы не изменяются;
-2. дополнительные неожиданные ключи ответа не применяются;
-3. ошибка не очищает старые значения output-полей;
-4. если контекст или входная зависимость изменилась во время запроса, устаревший ответ не применяется;
-5. после успешного действия результат остаётся редактируемым;
-6. значение не генерируется автоматически только потому, что поле пустое.
-
-Если output уже заполнен вручную, заменить его можно только явным нажатием пользователем соответствующей кнопки. Для действия с несколькими output UI должен заранее сообщить, какие поля будут заменены.
-
----
-
-## 6. Отдельное правило для пары дат `DBD + DBA`
-
-### 6.1. `Random` возле `DBD` — одно групповое действие
-
-Схема:
+**Случайное имя — один клик меняет три поля:**
 
 ```json
 {
-  "inputFields": ["DAJ", "DBB"],
-  "outputFields": ["DBD", "DBA"]
+  "profileId": "US_CA_08292017",
+  "actionId": "random:DAC+DAD+DCS",
+  "values": { "DBC": 1 }
 }
 ```
 
-Кнопка должна называться понятно, например **«Сгенерировать даты выдачи и окончания»**, потому что она меняет два поля.
-
-Один вызов `random` обязан возвращать одну связанную пару:
-
 ```json
 {
-  "input": {
-    "DAJ": "CA",
-    "DBB": "07191994"
-  },
-  "output": ["DBD", "DBA"]
+  "success": true,
+  "actionId": "random:DAC+DAD+DCS",
+  "values": { "DAC": "JOHN", "DAD": "MICHAEL", "DCS": "SMITH" }
 }
 ```
 
-Нельзя разбивать пару на два независимых вызова и затем склеивать `DBD` из одного ответа с `DBA` из другого.
-
-### 6.2. Проверка и максимум 10 попыток
-
-Для каждой полной пары BFF:
-
-1. строго разбирает обе даты в формате выбранной ревизии;
-2. проверяет календарную корректность, включая месяц `01..12`;
-3. проверяет, что `DBD` находится в окне ревизии;
-4. проверяет, что `DBA > DBD`.
-
-Один полный ответ `DBD + DBA` считается одной попыткой.
-
-Если пара не прошла проверку, BFF отбрасывает **обе даты** и повторяет групповой `random`. Допускается максимум **10 попыток**.
-
-Если после десятой попытки валидная пара не получена, BFF возвращает бизнес-ошибку:
-
-> Невозможно сгенерировать допустимые даты для выбранной ревизии.
-
-При этой ошибке:
-
-- прежние значения `DBD` и `DBA` в форме сохраняются;
-- частичный результат не применяется;
-- следующие действия не запускаются;
-- PDF417 и Billing не вызываются.
-
-При успехе `DBD` и `DBA` записываются в форму **атомарно**.
-
-Если одно или оба поля уже заполнены, UI перед запросом явно предупреждает, что успешная генерация заменит оба значения.
-
-### 6.3. Ручной `DBD` и `Calculate` для `DBA`
-
-Пользователь может ввести `DBD` вручную и отдельно нажать `Calculate` возле `DBA`.
-
-Тогда выполняется действие:
+**Kentucky DAQ — кнопка недоступна без DBD:**
 
 ```json
 {
-  "input": {
-    "DAJ": "CA",
+  "profileId": "US_KY_08312018",
+  "actionId": "random:DAQ",
+  "values": {
+    "DAJ": "KY",
     "DBB": "07191994",
+    "DCS": "SMITH",
     "DBD": "04162023"
-  },
-  "output": ["DBA"]
+  }
 }
 ```
 
-В этом сценарии:
+```json
+{
+  "success": true,
+  "actionId": "random:DAQ",
+  "values": { "DAQ": "S12345678" }
+}
+```
 
-- `DBD` не изменяется;
-- меняется только `DBA`;
-- десять random-попыток не применяются, потому что `calculate` детерминирован;
-- невалидный ответ возвращается как ошибка и не очищает прежний `DBA`.
+**Washington — два явных клика, а не автопродолжение:**
 
-После `Random` или `Calculate` пользователь всё равно может вручную изменить любую дату. Финальный Standard flow не должен повторно генерировать или восстанавливать пару без отдельного клика.
+```text
+клик 1: random:DCJ      [DAJ] → [DCJ]
+клик 2: calculate:DCF   [DAJ, DAQ, DCJ] → [DCF]
+```
 
----
+После первого ответа BFF frontend только записывает `DCJ` и разблокирует вторую кнопку.
 
-## 7. Шаг 4 — финальная генерация PDF417
+## 7. Короткие actions по всем ревизиям
 
-### 7.1. Публичный BFF-контракт
+Формат ниже:
 
-Frontend вызывает существующую unified-ручку, но с новым явным режимом `standard`:
+```text
+поле — random/calculate: [что взять] → [что вернуть]
+```
+
+Это не автоматическая цепочка. Каждая строка — отдельная кнопка. Порядок определяется только наличием inputs.
+
+Базовые поля можно заполнить вручную. Кроме этого, `topFields()` BarcodeGen задаёт три общих legacy-actions для всех 55 профилей:
+
+- `DAC + DAD + DCS` — random: `[DBC] → [DAC, DAD, DCS]`;
+- `DBB` — random: `[] → [DBB]`;
+- `DAG + DAI + DAK` — random: `[DAJ] → [DAG, DAI, DAK]`.
+
+Они тоже запускаются только кнопкой и заменяют всю указанную группу атомарно. Физические данные и option-поля остаются ручными.
+
+Ниже перечислены profile-specific actions. Для grouped dates BFF хранит полный проверяемый контекст `[DAJ, DBB, DDB, DDA]`; adapter передаёт BarcodeGen поддерживаемый handler input. Для `DBA` отдельно сохранён его `calculateHandler`: обычно `[DAJ, DBB, DBD] → [DBA]`; исключения указаны прямо в профиле.
+
+### 1. California DL — `US_CA_08292017`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DBA] → [DCF]`.
+
+### 2. California ID — `US_CA_08292017_ID`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DBA] → [DCF]`.
+
+### 3. Utah 2021 — `US_UT_06012021`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD, DDB] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 4. Utah 2016 — `US_UT_04152016`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD, DDB] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 5. Michigan 2011 — `US_MI_Rev_01-21-2011`
+
+- `DAQ` — random: `[DAJ, DAC, DAD, DCS, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ, DBB, DBA] → [DCK]`.
+- Отдельного action для `DCF` нет.
+
+### 6. Illinois 2015 — `US_IL_09172015`
+
+- `DAQ` — random: `[DAJ, DAC, DAD, DCS, DBB, DBC] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 7. Nevada 2021 — `US_NV_05242021`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+
+### 8. Nevada 2008 — `US_NV_10102008`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+
+### 9. Georgia 2015 — `US_GA_07012015`
+
+- `DAQ` — random: `[DAJ, DDB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB, DCK] → [DCF]`.
+- `county` пользователь выбирает вручную; adapter маппит его в `ZGD`.
+
+### 10. Georgia 2019 — `US_GA_01022019`
+
+- `DAQ` — random: `[DAJ, DDB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+- Source self-edge `DCK → DCK` не используется; registry хранит исправленное правило без self-dependency.
+
+### 11. North Carolina 2014 — `US_NC_10242014`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 12. Massachusetts 2016 — `US_MA_02222016`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 13. Minnesota 2017 — `US_MN_10232017`
+
+- `DAQ` — random: `[DAJ, DAC, DAD, DCS, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 14. Connecticut 2017 — `US_CT_02102017`
+
+- `DAQ` — random: `[DAJ, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 15. Missouri 2020 — `US_MO_01272020`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 16. Iowa 2017 — `US_IA_06292017`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ, DBD] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- Повторяющийся `DBD` в source metadata дедуплицируется.
+
+### 17. Montana 2015 — `US_MT_10072015`
+
+- `DAQ` — random: `[DAJ, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 18. Nebraska 2021 — `US_NE_04052021`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DCK, DBD] → [DCF]`.
+
+### 19. Rhode Island 2016 — `US_RI_01262016`
+
+- `DAQ` — random: `[DAJ, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 20. Idaho 2023 — `US_ID_01312023`
+
+- `DAQ` — random: `[DAJ, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 21. West Virginia 2019 — `US_WV_06042019`
+
+- `DAQ` — random: `[DAJ, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 22. Arizona 2014 — `US_AZ_02142014`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD, DDA] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DCS, DAC, DBB] → [DCF]`.
+
+### 23. Arizona 2023 — `US_AZ_03012023`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD, DDA] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DBD] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DCS, DAC, DBB] → [DCF]`.
+
+### 24. Kansas 2017 — `US_KS_02242017`
+
+- `DAQ` — random: `[DAJ, DAC, DCS, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+
+### 25. Pennsylvania 2016 — `US_PA_06072016`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DBB] → [DCF]`.
+
+### 26. Pennsylvania 2022 — `US_PA_03252022`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DBB] → [DCF]`.
+
+### 27. Arkansas 2018 — `US_AR_03012018`
+
+- `DAQ` — random: `[DAJ, DAC, DCS, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DCS, DAC, DBB] → [DCF]`.
+
+### 28. Florida 2019 — `US_FL_05012019`
+
+- `DAQ` — random: `[DAJ, DAC, DAD, DCS, DBB, DBC] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- `safeDriver` — ручной toggle; это не random/calculate action.
+
+### 29. Florida 2020 — `US_FL_03012020`
+
+- `DAQ` — random: `[DAJ, DAC, DAD, DCS, DBB, DBC] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- `safeDriver` — ручной toggle; это не random/calculate action.
+
+### 30. Mississippi 2016 — `US_MS_02222016`
+
+- `DAQ` — random: `[DAJ, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 31. North Dakota 2014 — `US_ND_01082014`
+
+- `DAQ` — random: `[DAJ, DAC, DCS, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 32. Kentucky 2018 — `US_KY_08312018`
+
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DAQ` — random: `[DAJ, DBB, DCS, DBD] → [DAQ]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- Кнопка `DAQ` становится доступна после заполнения `DBD`; сама не запускается после dates action.
+
+### 33. Tennessee 2011 — `US_TN_12022011`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 34. Delaware 2017 — `US_DE_08022017`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 35. Indiana 2018 — `US_IN_07242018`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 36. Washington 2019 — `US_WA_11122019`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCJ` — random: `[DAJ] → [DCJ]`.
+- `DCF` — calculate: `[DAJ, DAQ, DCJ] → [DCF]`.
+- Action для `DCK` отсутствует.
+
+### 37. South Carolina 2018 — `US_SC_01012018`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- Action для `DCK` отсутствует.
+
+### 38. New Jersey 2020 — `US_NJ_01082020`
+
+- `DAQ` — random: `[DAJ, DAC, DAD, DCS, DBB, DBC, DAY] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD] → [DCF]`.
+
+### 39. Alabama 2014 — `US_AL_11012014`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 40. Colorado 2015 — `US_CO_10302015`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD, DDA] → [DBA]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- `DCJ` — random: `[DAJ] → [DCJ]`.
+- Action для `DCK` отсутствует.
+
+### 41. Maryland 2016 — `US_MD_06202016`
+
+- `DAQ` — random: `[DAJ, DAD, DAC, DCS, DBB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 42. Wisconsin 2015 — `US_WI_09012015`
+
+- `DAQ` — random: `[DAJ, DAD, DAC, DCS, DBB, DBC] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DBD, DBA] → [DCF]`.
+
+### 43. Oregon 2018 — `US_OR_07092018`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+
+### 44. Louisiana 2015 — `US_LA_02102015`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- `DCJ` (`auditCode`) — только ручной input; random action отсутствует.
+
+### 45. Texas 2016 — `US_TX_10102016`
+
+- `DAQ` — random: `[DAJ, DDB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB, DAQ, DBD] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+
+### 46. Texas 2020 — `US_TX_02232020`
+
+- `DAQ` — random: `[DAJ, DDB] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB, DBD] → [DCF]`.
+
+### 47. Virginia 2008 — `US_VA_12102008`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+
+### 48. Virginia 2023 — `US_VA_04222023`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DDB] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+
+### 49. Ohio 2018 — `US_OH_07012018`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ] → [DCF]`.
+- `DAX` не является кнопкой: internal derivation считает `Math.round(DAW * 0.45359237)`.
+
+### 50. New Mexico 2016 — `US_NM_06162016`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ, DAQ] → [DCK]`.
+- Action для `DCF` отсутствует: builder использует собственное фиксированное значение.
+
+### 51. New York 2017 — `US_NY_09282017`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+- Action для `DCK` отсутствует.
+
+### 52. New York 2022 — `US_NY_03072022`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCF` — calculate: `[DAJ, DDB] → [DCF]`.
+- Action для `DCK` отсутствует.
+
+### 53. New Hampshire 2016 — `US_NH_06092016`
+
+- `DAQ` — random: `[DAJ] → [DAQ]`.
+- `DBD + DBA` — random: `[DAJ, DBB, DDB, DDA] → [DBD, DBA]`.
+- `DBA` — calculate: `[DAJ, DBB, DBD] → [DBA]`.
+- `DCK` — calculate: `[DAJ] → [DCK]`.
+- `DCF` — calculate: `[DAJ, DCK] → [DCF]`.
+
+### 54. Ontario 2017 — `CA_ON_08292017`
+
+- Подтверждённых province-specific random/calculate actions нет.
+- В source descriptor есть общие handlers, но BFF их не публикует, пока не подтверждены канадские форматы и правила.
+- `DAQ`, `DBD`, `DBA`, `DCK`, `DCF` пользователь вводит вручную.
+- BFF валидирует даты и канадские форматы, но не запускает чужие US actions.
+- Рост переводится в сантиметры adapter-ом; отдельной кнопки для этого нет.
+
+### 55. Alberta 2017 — `CA_AB_08292017`
+
+- Подтверждённых province-specific random/calculate actions нет.
+- В source descriptor есть общие handlers, но BFF их не публикует, пока не подтверждены канадские форматы и правила.
+- `DAQ`, `DBD`, `DBA`, `DCF` пользователь вводит вручную.
+- `DCK` профилю не нужен.
+- BFF валидирует даты и канадские форматы, но не запускает чужие US actions.
+- Рост и вес переводятся в профильные единицы adapter-ом; отдельных кнопок для этого нет.
+
+## 8. Финальный Prepared Generate
+
+Frontend отправляет полный снимок формы:
 
 ```http
 POST /api/v1/barcode/generate
-X-Idempotency-Key: <stable key>
+X-Idempotency-Key: <stable-key>
 Content-Type: application/json
 ```
 
@@ -427,13 +926,13 @@ Content-Type: application/json
 {
   "revision": "US_CA_08292017",
   "barcodeType": "pdf417",
-  "mode": "standard",
+  "mode": "prepared",
   "units": 1,
   "confirmed": true,
   "fields": {
-    "DBC": 1,
     "DAJ": "CA",
     "DDB": "08292017",
+    "QQQ": "DL",
     "DAC": "JOHN",
     "DAD": "",
     "DCS": "SMITH",
@@ -442,177 +941,181 @@ Content-Type: application/json
     "DAG": "123 MAIN ST",
     "DAI": "LOS ANGELES",
     "DAK": "90001",
+    "DBC": 1,
     "DDA": "F",
-    "QQQ": "DL",
     "DAQ": "A1234567",
-    "DCA": "C",
-    "DDK": 1,
-    "DDL": 1,
     "DBD": "04162023",
     "DBA": "07192028",
     "DCK": "23106A12345670401",
+    "DCF": "04/16/2023ABCDE/1234/28",
+    "DCA": "C",
+    "DCB": "NONE",
+    "DCD": "NONE",
     "DAU": "70",
     "DAW": "180",
-    "DCF": "04/16/2023ABCDE/1234/28",
-    "DAZ": "BRO",
     "DAY": "BRO",
-    "DCB": "NONE",
-    "DCD": "NONE"
+    "DAZ": "BRO",
+    "DDK": 0,
+    "DDL": 0
   }
 }
 ```
 
-Пример намеренно содержит **все** коды полной CA DL-формы, а не только минимальный набор, который случайно не роняет builder.
+BFF в ветке `prepared`:
 
-### 7.2. Изменения режима в текущем BFF
+1. загружает exact profile и актуальную полную форму;
+2. проверяет контекст `DAJ/DDB/QQQ`;
+3. проверяет наличие всех `expectedCodes`;
+4. отклоняет неизвестные поля;
+5. проверяет options, pattern, даты и profile-specific правила;
+6. не запускает ни одного action;
+7. только после validation вызывает Billing Block;
+8. вызывает internal PDF417 render;
+9. делает Capture при успехе или Release при ошибке.
 
-Сейчас `GenerateRequest.Mode` документирован как `auto | prepared`, frontend-тип содержит только эти два значения, а условие `if req.Mode != "prepared"` запускает цепочку для любой другой строки. Просто отправить `mode=standard` сейчас нельзя: BFF ошибочно запустит Auto Flow.
+Псевдокод целевого ветвления:
 
-Нужно:
-
-1. расширить `GenerateRequest.Mode` и frontend `GenerationMode` значением `standard`;
-2. до quote разрешать только `auto`, `prepared`, `standard` и отклонять опечатки;
-3. заменить отрицательную проверку `mode != prepared` на явный `switch`;
-4. выполнять `ChainExecutor` только в ветке `auto`;
-5. в ветке `standard` использовать точную копию `req.Fields`;
-6. не вызывать `applyChoiceFallbacks`, `ApplyEngineDefaults`, semantic alias mapping или state-specific BFF transforms для Standard;
-7. не фильтровать неизвестные ключи молча через `filterRenderValues`: несовпадение с текущей формой должно вернуть явный `422` до Billing.
-
-`prepared` остаётся техническим режимом Auto Flow после `prepare` и не подменяет Standard: у них разные гарантии происхождения и полноты данных.
-
-### 7.3. Проверка полного payload
-
-Frontend и BFF независимо получают `expectedCodes` из одной полной формы `BarcodeGen` (`flag=false`). До quote/Billing BFF проверяет:
-
-1. `DAJ`, `DDB` и `QQQ` совпадают с выбранным контекстом;
-2. каждый `expectedCode` присутствует в `fields` как собственный ключ;
-3. неожиданных ключей вне текущей формы нет;
-4. `""` и `0` сохранены и не считаются отсутствием;
-5. select/radio/choiser содержит значение из фактических `values` поля;
-6. `pattern` и формат даты соблюдены;
-7. финальная ручная пара `DBD + DBA` валидна по правилам `ISS_DBD_FLOW.md`.
-
-Если отсутствует хотя бы один ключ, возвращается `422 INCOMPLETE_STANDARD_PAYLOAD` со списком `{code, label}`. BFF не пытается выяснять, какое поле «можно было бы» дописать автоматически.
-
-`randomHandler`/`calculateHandler` определяют только доступность кнопок. Они не сокращают множество полей финального payload.
-
-### 7.4. Где живут преобразования
-
-Пользователь предоставляет весь **публичный state-specific payload**, который вернула форма. BFF не меняет его предметные значения.
-
-Технические производные, которых нет среди полей формы, остаются внутри `BarcodeGen`. Например, текущий internal render вызывает `applyInternalDerivations` до exact builder; это допустимо для `DAX`, если форма требует от пользователя исходный `DAW`, но не показывает `DAX`. BFF не должен дублировать такую формулу.
-
-Если полная форма возвращает код, который `config.renderFields` того же профиля запрещает, это дефект единого контракта `BarcodeGen`. Его нужно исправить в `barcode-config.service.ts`; BFF не должен скрывать расхождение молчаливой фильтрацией.
-
-### 7.5. Billing и реальный internal render
-
-Порядок обязателен:
-
-1. загрузить актуальную полную форму выбранного контекста;
-2. проверить точное покрытие `expectedCodes` и все детерминированные правила;
-3. сформировать стабильные `buildId`, `batchId`, `renderKey` и idempotency key;
-4. только после этого вызвать `Billing.Block`;
-5. вызвать internal PDF417;
-6. выполнить `Capture` при успехе или гарантированный `Release` при любой ошибке до Capture.
-
-В `BARCODEGEN_MODE=internal` BFF уже имеет правильный transport в `internal/adapters/barcodegen/legacy/internal_client.go`. Реальный downstream-вызов:
-
-```http
-POST /api/internal/v1/barcodes/pdf417
-X-Service-Token: <service token>
-Content-Type: application/json
+```go
+switch req.Mode {
+case "auto":
+    values = chainExecutor.ExecuteGrouped(ctx, profile, req.Fields)
+case "prepared":
+    values = validateCompletePreparedFields(profile, req.Fields)
+default:
+    return ErrUnsupportedMode
+}
 ```
+
+Нельзя оставлять проверку вида `if mode != "prepared"`, потому что опечатка в mode попадёт в Auto Flow.
+
+### 8.1. Успешный ответ BFF
 
 ```json
 {
-  "ownerId": "<authenticated user id>",
-  "renderKey": "<stable generation id>",
-  "values": {
-    "DBC": 1,
-    "DAJ": "CA",
-    "DDB": "08292017",
-    "DAC": "JOHN",
-    "DAD": "",
-    "DCS": "SMITH",
-    "DCU": "",
-    "DBB": "07191994",
-    "DAG": "123 MAIN ST",
-    "DAI": "LOS ANGELES",
-    "DAK": "90001",
-    "DDA": "F",
-    "QQQ": "DL",
-    "DAQ": "A1234567",
-    "DCA": "C",
-    "DDK": 1,
-    "DDL": 1,
-    "DBD": "04162023",
-    "DBA": "07192028",
-    "DCK": "23106A12345670401",
-    "DAU": "70",
-    "DAW": "180",
-    "DCF": "04/16/2023ABCDE/1234/28",
-    "DAZ": "BRO",
-    "DAY": "BRO",
-    "DCB": "NONE",
-    "DCD": "NONE"
+  "success": true,
+  "barcodeUrl": "https://.../barcodes/7c7a.png",
+  "format": "pdf417",
+  "metadata": {
+    "generationId": "7c7a...",
+    "revision": "US_CA_08292017",
+    "mode": "prepared"
   }
 }
 ```
 
-Для `BarcodeGen` все пользовательские значения равноправны: часть введена вручную, часть получена через явные actions. Источник значения не влияет на render.
+### 8.2. Неполная форма
 
-### 7.6. Какой BFF-адаптер допустим
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INCOMPLETE_PREPARED_PAYLOAD",
+    "message": "Заполните все поля выбранной ревизии",
+    "fields": [
+      { "code": "DCK", "label": "Inventory Control Number" },
+      { "code": "DCF", "label": "Document Discriminator" }
+    ]
+  }
+}
+```
 
-Для финального Standard render целевым является `InternalClient`:
+HTTP: `422`. До Billing и BarcodeGen render запрос не доходит.
 
-- его путь совпадает с реальным `InternalController`;
-- `mapFieldsEngine` пропускает полный известный AAMVA namespace;
-- service-token отделяет BFF-вызов от публичного user/billing flow `BarcodeGen`;
-- grouped actions сохраняют атомарность нескольких outputs.
+### 8.3. Невалидное значение
 
-Текущие альтернативы неэквивалентны:
+```json
+{
+  "success": false,
+  "error": {
+    "code": "PREPARED_FIELD_INVALID",
+    "message": "Поле DCA содержит недопустимое значение",
+    "fields": [
+      {
+        "code": "DCA",
+        "label": "Vehicle Class",
+        "value": "X"
+      }
+    ]
+  }
+}
+```
 
-- native `internal/adapters/barcodegen/http_client.go` вызывает вымышленные `/api/v1/generate/pdf417`, `/api/v1/random` и `/api/v1/calculate`, которых нет в реальном `BarcodeGen`;
-- legacy `mapping.go::valuesWhitelist` молча выбрасывает многие реальные коды полной формы (`DBC`, `DCA`, `DCB`, `DCD`, `DAW`, `DAZ`, `DDK`, `DDL`, `DDA`, `QQQ` и другие).
+HTTP: `422`.
 
-Поэтому Standard нельзя включать через `BARCODEGEN_MODE=native` или через старый public render adapter. Получение формы может идти через public `POST /api/v1/barcodes` с service JWT, но финальный PDF417 должен идти через `/api/internal/v1/barcodes/pdf417`. Любая поддержка legacy-render потребует отдельного исправления публичного DTO и удаления lossy whitelist; молчаливое урезание полного пользовательского payload запрещено.
+## 9. Что изменить в BFF и frontend
 
----
+### 9.1. BFF
 
-## 8. Сравнение режимов
+1. Не добавлять `mode=standard`; использовать `mode=prepared`.
+2. Для Prepared schema получать полную форму BarcodeGen с `flag=false`.
+3. Хранить exact-profile registry коротких actions из раздела 7.
+4. Отдавать action рядом с конкретным полем в schema response.
+5. Добавить `POST /api/v1/barcode/action`.
+6. В action request доверять только `profileId`, `actionId` и текущим values; dependencies брать из registry.
+7. Переиспользовать random/calculate adapters Auto Flow, но не `ChainExecutor`.
+8. В `generate_usecase.go` запускать executor только для exact `mode=auto`.
+9. Для `mode=prepared` использовать полный пользовательский payload без повторной генерации.
+10. Все ошибки Prepared validation возвращать до Billing.
 
-| Этап | Auto / Light | Standard / Regular — основной |
-|---|---|---|
-| Видимые поля | Сокращённая анкета | Все `top + down[type]` из `POST /api/v1/barcodes` с `flag=false` |
-| Полнота входа | Пользователь даёт только base input | Пользователь даёт каждый `abr/code` полной формы |
-| Служебные поля | Скрыты | Видимы и редактируемы |
-| `random/calculate` | BFF исполняет цепочку автоматически | Только по явному нажатию пользователя |
-| Ручной ввод output-полей | Обычно отсутствует | Разрешён и имеет приоритет до явного действия |
-| Пара `DBD + DBA` | Генерируется BFF как атомарный шаг | Генерируется атомарно только по кнопке; ручной ввод остаётся разрешён |
-| Финальная кнопка | Запускает Auto Flow и render | Проверяет полную пользовательскую карту и вызывает render без derive |
-| Источник полей | Auto YAML-профиль + chain | Только фактическая форма `BarcodeGen`; BFF YAML не участвует |
+### 9.2. Frontend
 
----
+1. Рендерить все поля Prepared schema.
+2. Хранить значения в одной карте по AAMVA-кодам.
+3. Показывать кнопку только при наличии `field.action`.
+4. Disable кнопки, пока не заполнены её inputs.
+5. По клику отправлять один `actionId`.
+6. Применять только `response.values` как patch.
+7. Не запускать следующую кнопку автоматически.
+8. Предупреждать перед заменой уже заполненных outputs.
+9. Разрешать ручное редактирование после action.
+10. Финально отправлять `mode=prepared` и полный fields object.
 
-## 9. Критерии приёмки
+## 10. Проверки
 
-1. Для Standard BFF получает форму из реального `POST /api/v1/barcodes` с `flag=false`, а не из `configs/revisions/*.yaml`.
-2. Ответ содержит общие `top`-поля и state-specific `down[type]`; BFF не теряет `abr`, options, handlers, initial value, порядок или группу.
-3. Пользователь может собрать payload полностью вручную, не вызывая ни одного action.
-4. Финальная карта содержит каждый уникальный `abr/code` полученной формы, включая `DAJ`, `DDB` и `QQQ`.
-5. Отсутствующий ключ даёт `422 INCOMPLETE_STANDARD_PAYLOAD` до quote/Billing; BFF ничего не догенерирует.
-6. Явные `""` и `0` сохраняются и считаются переданными значениями; UI-переключатели отправляют числовые `0/1` из схемы, а не boolean/string surrogate.
-7. Пустое поле само по себе не запускает генерацию.
-8. `Random/Calculate` видны только для handlers текущей формы.
-9. При нехватке зависимостей action не отправляется, а UI показывает конкретные поля.
-10. BFF повторно проверяет action по актуальной форме и не допускает произвольный output.
-11. Успешное действие меняет только объявленные output-поля; ошибка не очищает старые значения.
-12. Устаревший ответ после смены контекста или входов не применяется.
-13. `Random` для `DBD` получает `DBD + DBA` одним grouped-вызовом и применяет их атомарно.
-14. Невалидная сгенерированная пара повторяется максимум 10 раз; затем возвращается явная ошибка, а render и Billing не запускаются.
-15. `Calculate DBA` сохраняет введённый вручную `DBD` и меняет только `DBA`.
-16. После action пользователь может вручную изменить любое output-поле.
-17. `mode=standard` является разрешённым отдельным режимом и не попадает в ветку Auto из-за проверки `mode != prepared`.
-18. Финальная кнопка Standard не вызывает `random`, `calculate`, `prepare` или `ChainExecutor`.
-19. `applyChoiceFallbacks`, `ApplyEngineDefaults`, silent alias/default injection и silent render filtering не применяются к Standard.
-20. Все проверки полного payload выполняются до `Billing.Block`, а downstream идёт в `/api/internal/v1/barcodes/pdf417` с полным пользовательским `values`.
+### 10.1. Contract tests BFF
+
+Для каждого из 55 профилей:
+
+- schema содержит правильные короткие actions;
+- action inputs и outputs точно совпадают с разделом 7;
+- неизвестный action отклоняется;
+- лишний input не отправляется downstream;
+- неожиданный output не применяется;
+- action не вызывает Billing или render;
+- final Prepared Generate не вызывает random/calculate;
+- пустые `""` и числовые `0` не теряются.
+
+### 10.2. Особые fixtures
+
+Обязательны отдельные тесты:
+
+- California DL и ID как разные exact profiles;
+- Michigan literal revision `Rev 01-21-2011`;
+- Kentucky: `DAQ` зависит от `DBD`, но не запускается после dates action;
+- Georgia 2019: self-edge `DCK → DCK` отсутствует;
+- Iowa: повторный `DBD` дедуплицирован;
+- WA/CO: отдельный random `DCJ`;
+- LA: `DCJ` только ручной;
+- Ohio: `DAX` выводится из `DAW` без UI-action;
+- New Mexico: нет action `DCF`;
+- NY/WA/SC/CO/AB: нет action `DCK`;
+- ON/AB: нет подстановки US actions;
+- даты возвращаются и применяются атомарно.
+
+## 11. Критерии приёмки
+
+1. В системе остаются только `auto` и `prepared`.
+2. Prepared показывает полную форму exact revision.
+3. Пользователь может заполнить всю форму без actions.
+4. Для каждого generated/calculated поля показывается только сохранённый exact-profile action.
+5. Нажатие выполняет только один action.
+6. Следующий action не запускается автоматически.
+7. BFF не доверяет присланным клиентом dependencies.
+8. Ответ action содержит только patch `values`.
+9. Ошибка action не очищает форму.
+10. `DBD + DBA` генерируются и применяются атомарно.
+11. После action любое output-поле остаётся редактируемым.
+12. Финальный `mode=prepared` не вызывает `prepare`, `ChainExecutor`, random или calculate.
+13. Полнота и валидация проверяются до Billing.
+14. Все 55 профилей покрыты contract tests.
+15. ON/AB не получают выдуманные US helper rules.
