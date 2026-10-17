@@ -21,10 +21,10 @@
 
 Перед кодированием обязательны четыре устранения неоднозначности, уже зафиксированные ниже:
 
-1. exact BarcodeGen profile передаётся явным `barcodeGenContext`, а не выводится парсингом имени YAML;
-2. metadata запрашивается через service-authenticated internal endpoint с identity envelope и без silent fallback;
-3. Prepared-профиль не включается, пока для него не заполнены `requiredRenderFields` и field policy;
-4. editable `fallbackValue` отделён от hidden immutable constants и Auto-only defaults.
+1. YAML-профили BFF полностью удаляются из runtime: BFF не хранит состав формы, required/render lists, defaults, constants или action matrix по ревизиям;
+2. список exact-профилей и metadata запрашиваются напрямую у BarcodeGen через service-authenticated internal endpoints без silent fallback;
+3. обязательность, допустимые render-поля, server-owned identity/constants и редкие profile-specific исключения принадлежат exact builder contract BarcodeGen и возвращаются вместе со schema;
+4. `initialValue` является только начальным состоянием frontend: BFF никогда не дописывает отсутствующее пользовательское значение и не заменяет явно отправленные `""`, `0` или `false`.
 
 Пользователь:
 
@@ -237,11 +237,11 @@ BFF получает этот полный metadata payload у BarcodeGen в run
 - `internal/usecase/chain_executor.go` — последовательное выполнение grouped random/calculate в Auto;
 - `generate_usecase.go` — текущая развилка `auto`/`prepared`, Billing и render;
 - `internal/domain/engine_fields.go` — semantic → AAMVA mapping;
-- `internal/adapters/barcodegen/legacy/client.go` — BarcodeGen adapter;
-- `internal/adapters/barcodegen/legacy/internal_client.go` — grouped derive и internal render;
-- `configs/revisions/*.yaml` — explicit `barcodeGenContext`, Prepared constants, required/render policy и Auto defaults; после рефакторинга это не копия полной UI-формы BarcodeGen.
+- `internal/adapters/barcodegen/legacy/client.go` — старый public adapter;
+- `internal/adapters/barcodegen/legacy/internal_client.go` — уже существующий прямой internal adapter: grouped derive и internal render через BarcodeGen;
+- `configs/revisions/*.yaml`, `RevisionConfigStore` и зависящие от них defaults/required/render policies — удаляемый legacy-слой и второй источник истины.
 
-Prepared schema/action должны переиспользовать BarcodeGen adapter: schema получает полный payload через `POST /api/internal/v1/barcodes/fields`, action повторно разрешает handler по этому payload и вызывает один low-level random/calculate. `ChainExecutor` не используется, потому что он продолжает Auto-цепочку, а ручной клик обязан выполнить ровно один action.
+Prepared schema/action должны переиспользовать прямой BarcodeGen adapter. Список профилей и schema приходят от BarcodeGen, action повторно разрешает handler по свежему payload и вызывает один low-level random/calculate. `ChainExecutor` не используется, потому что он продолжает Auto-цепочку, а ручной клик обязан выполнить ровно один action. Общий semantic codec может оставаться в BFF, но в нём нет веток по штатам; редкие поля получают безопасное `publicName` из metadata BarcodeGen.
 
 ### 2.4. Что сейчас делает новый Nuxt frontend
 
@@ -341,21 +341,9 @@ mode=prepared
 GET /api/v1/revisions/US_CA_08292017/schema?mode=prepared
 ```
 
-`US_CA_08292017` является публичным opaque ID. Frontend не должен дополнительно присылать конкурирующие `country`, `state`, `revisionDate` или `documentType`. BFF также **не парсит** этот ID: суффикс `_ID`, literal Michigan и различие `CA`/`CAN` делают такой parser хрупким.
+`US_CA_08292017` — публичный `profileId`, выданный BarcodeGen. Frontend не присылает рядом конкурирующие `country`, `state`, `revisionDate` или `documentType`, а BFF не разбирает ID и не ищет его в YAML. Список для selector-а BFF также проксирует из `GET /api/internal/v1/barcodes/profiles` BarcodeGen.
 
-Каждый enabled BFF-профиль явно хранит server-owned context:
-
-```yaml
-barcodeGenContext:
-  country: USA
-  state: CA
-  revision: "08292017"
-  documentType: DL
-```
-
-Для Ontario/Alberta используется `country: CAN`; для Michigan `revision: "Rev 01-21-2011"`. Поле BFF `country: US|CA`, управляющее кодированием дат, не заменяет `barcodeGenContext.country: USA|CAN`.
-
-BFF **не собирает полную форму из собственного дубликата BarcodeGen config**. Для schema/action/final Prepared validation он вызывает additive internal metadata route:
+Для schema/action/final Prepared validation BFF вызывает прямую internal metadata route:
 
 ```http
 POST {BARCODEGEN_URL}/api/internal/v1/barcodes/fields
@@ -364,57 +352,57 @@ X-Service-Token: <BARCODEGEN_SERVICE_TOKEN>
 Content-Type: application/json
 ```
 
-Для California DL BFF отправляет:
-
 ```json
 {
-  "country": "USA",
-  "DAJ": "CA",
-  "DDB": "08292017",
-  "type": "DL",
+  "profileId": "US_CA_08292017",
   "flag": false
 }
 ```
 
-Internal route использует тот же `BarcodeConfigService`, но выполняет exact lookup без fallback. Если `{country,DAJ,DDB}` не найден или `down[type]` отсутствует, она возвращает `404 PROFILE_NOT_FOUND`; первый config никогда не подставляется. Успешный ответ содержит identity envelope и существующий flattened payload:
+BarcodeGen сам связывает `profileId` с exact `{country, DAJ, DDB, type}`, использует тот же `BarcodeConfigService`/builder и выполняет lookup без fallback. Неизвестный profile/type возвращает `404 PROFILE_NOT_FOUND`; первый config никогда не подставляется.
+
+Успешный ответ содержит не только descriptors, но и исполнимый контракт того же builder-а:
 
 ```json
 {
   "profile": {
+    "id": "US_CA_08292017",
     "country": "USA",
     "DAJ": "CA",
     "DDB": "08292017",
-    "type": "DL"
+    "type": "DL",
+    "revisionEffectiveDate": "2017-08-29"
+  },
+  "renderContract": {
+    "allowedFields": ["DAC", "DAD", "DCS", "DCU", "DBB", "DBC", "DAG", "DAI", "DAK", "DAQ", "DBD", "DBA", "DCK", "DCF", "DAU", "DAW", "DAY", "DAZ", "DCA", "DCB", "DCD", "DDA", "DDK", "DDL"],
+    "requiredFields": ["DAC", "DCS", "DBB", "DBC", "DAG", "DAI", "DAK", "DAQ", "DBD", "DBA", "DCK", "DCF", "DAU", "DAW", "DAY", "DAZ", "DCA", "DCB", "DCD"]
   },
   "fields": []
 }
 ```
 
-`profile` обязан точно совпасть с server-owned context запроса. Иначе BFF возвращает `502 BARCODEGEN_PROFILE_MISMATCH`. Endpoint доступен только BFF; существующий public `POST /api/v1/barcodes` и его legacy response не меняются.
-
-`flag` всегда равен `false`: только так BarcodeGen возвращает полную форму — общую часть `top` и профильную `down[type]`, включая controls, values, `randomHandler` и `calculateHandler`. `flag=true` для Prepared запрещён.
+`DAJ`, `DDB`, `QQQ` и другие constants не передаются browser-ом и не хранятся в BFF: BarcodeGen добавляет их по `profileId`. `renderContract.requiredFields` — audited contract exact builder-а, а не ещё один список в BFF. `allowedFields` ограничивает payload, `requiredFields` задаёт обязательность; отсутствие required-contract считается ошибкой metadata и не означает «все optional».
 
 Дальше BFF выполняет ровно пять операций:
 
-1. Загружает explicit `barcodeGenContext`; значения не берутся из browser и не выводятся из имени revision.
+1. Принимает `profileId`, полученный ранее из BarcodeGen catalog; не парсит его и не загружает YAML.
 2. Вызывает internal fields endpoint с `flag=false`; browser не получает BarcodeGen credentials.
-3. Сверяет response envelope с request context.
-4. Нормализует `fields` в публичный `PreparedRevisionSchema`: рекурсивно обходит вложенные arrays depth-first и обрабатывает только descriptor objects с `abr`. `DAJ`, `DDB`, `QQQ` исключаются как server-owned. Повтор одного `abr` допустим только для идентичного descriptor; конфликт возвращает `502 BARCODEGEN_BAD_METADATA`.
+3. Проверяет, что `profile.id` равен запрошенному `profileId` и что render contract непуст/согласован с descriptors.
+4. Нормализует descriptors в публичный `PreparedRevisionSchema`. Общие AAMVA-поля переводятся общим codec; редкое поле обязано иметь `publicName` в metadata BarcodeGen. `DAJ`, `DDB`, `QQQ` не становятся public fields.
 5. Отдаёт полную schema frontend-у.
 
 ```text
 Nuxt frontend
-  → GET BFF /api/v1/revisions/{exactRevision}/schema?mode=prepared
-  → BFF loads explicit barcodeGenContext
-  → POST BarcodeGen /api/internal/v1/barcodes/fields {...context, flag:false}
-  → BarcodeGen exact lookup returns {profile, fields: top + down[type]}
-  → BFF verifies envelope and normalizes fields/actions
+  → GET BFF /api/v1/revisions/{profileId}/schema?mode=prepared
+  → POST BarcodeGen /api/internal/v1/barcodes/fields {profileId, flag:false}
+  → BarcodeGen returns exact profile + renderContract + top/down descriptors
+  → BFF generically converts engine descriptors to semantic fields/actions
   → frontend renders every schema.fields item
 ```
 
-BarcodeGen владеет составом формы, controls, options и handlers. BFF хранит explicit context, semantic/AAMVA codecs, required/render policy и короткие Prepared exceptions. Полный список UI-полей и handlers в BFF не копируется.
+BarcodeGen — единственный источник exact-профиля, состава формы, options, handlers, required/allowed fields и constants. BFF владеет только общей orchestration, auth/Billing, strict public DTO и общим semantic ↔ AAMVA codec. Ни BFF YAML, ни state-specific `switch`, ни второй action/required registry не остаются.
 
-Первая реализация работает без cache/session-механизма: один schema request делает один metadata call. Позже допустим короткий server-side cache по exact `barcodeGenContext`; cache не меняет контракт.
+Первая реализация работает без cache/session-механизма: один schema request делает один metadata call. Позже допустим короткий server-side cache по `profileId`; cache не меняет контракт.
 
 ### 4.1. Единственный целевой TypeScript-контракт schema
 
@@ -442,7 +430,7 @@ type PreparedField = {
   control: "input" | "calendar" | "select" | "radio" | "toggle"
   required: boolean
   order: number
-  fallbackValue?: PreparedValue
+  initialValue?: PreparedValue
   options?: PreparedFieldOption[]
   validation?: {
     minLength?: number
@@ -476,44 +464,37 @@ type PreparedRevisionSchema = {
 4. `fields` отсортированы или сортируются frontend по `order`.
 5. `type=date` использует публичный формат `YYYY-MM-DD`. `MMDDYYYY`/`YYYYMMDD` являются только внутренними engine-форматами BFF.
 6. `type=enum` использует только typed `options[{value,label}]`; frontend показывает `label`, но сохраняет и отправляет `value` без преобразования.
-7. `fallbackValue`, включая `""`, `0` и `false`, применяется только если свойство реально присутствует в JSON.
+7. `initialValue`, включая `""`, `0` и `false`, применяется только если свойство реально присутствует в JSON.
 8. `action` присутствует только возле поля, у которого должна быть кнопка.
 9. Все имена внутри `inputFields` и `outputFields` обязаны существовать в `fields` этой же schema.
 10. Один action может вернуть несколько outputs. Для дат action находится у `issueDate`, но его `outputFields` равен `['issueDate', 'expirationDate']`.
 11. Если для `expirationDate` exact-профиль поддерживает отдельный calculate, это отдельный `action` самого поля `expirationDate`.
 12. `DAJ`, `DDB`, `QQQ`, другие AAMVA-коды и server-owned constants в `fields` не входят.
 
-Внутри exact-profile config BFF дополнительно хранит данные, которые browser не получает:
-
-- explicit `barcodeGenContext`;
-- semantic ↔ engine codecs;
-- hidden `preparedConstants`;
-- `renderAllowlist` и полный `requiredRenderFields`;
-- country/profile-specific кодирование дат, boolean и единиц измерения;
-- короткие policy exceptions раздела 7.
+BFF не хранит данные exact-профиля. Он знает только общий canonical semantic ↔ AAMVA codec и правила безопасности публичной границы. Exact identity, constants, required/allowed fields, country/profile transforms и редкие исключения приходят от BarcodeGen по `profileId`.
 
 ### 4.1.1. Required policy и граница готовности профиля
 
-Текущий BarcodeGen descriptor не содержит надёжного `required` признака, а builder читает часть полей безусловно. Поэтому `required` нельзя угадывать по `random=true`, пустому `value` или наличию handler-а.
+Текущий descriptor с `random/calculate` не доказывает обязательность: builder может безусловно вызывать `padStart`, `padEnd`, `toString` или вставлять поле в строку. Поэтому required нельзя угадывать по handler-у и нельзя брать из удаляемого YAML.
 
-Для Prepared источник обязательности один:
+Для Prepared источник обязательности один — `renderContract.requiredFields`, объявленный рядом с exact builder в BarcodeGen:
 
-1. engine code входит в `requiredRenderFields` exact BFF-профиля;
-2. normalizer переводит его в semantic field и ставит `required: true`;
-3. hidden constant считается удовлетворённым server-side и в public schema не появляется;
-4. required code без semantic field и без hidden constant делает профиль неготовым: schema возвращает `503 PREPARED_PROFILE_INCOMPLETE`.
+1. BarcodeGen fixture вызывает builder с полным валидным payload и negative fixtures по каждому required field;
+2. internal fields endpoint возвращает `allowedFields` и `requiredFields` того же exact builder-а;
+3. BFF normalizer переводит required engine code в semantic field и ставит `required: true`;
+4. server-owned identity/constants удовлетворяются внутри BarcodeGen и не входят в public schema;
+5. required code без общего semantic mapping или metadata `publicName` делает ответ BarcodeGen невалидным: BFF возвращает `502 BARCODEGEN_BAD_METADATA`.
 
-На момент аудита `requiredRenderFields` заполнен только в двух YAML-профилях (`US_WA_11122019`, `US_CO_10302015`). Нельзя включить Prepared для всех 55 одним флагом, пока каждый enabled профиль не прошёл fixture test builder-а и не получил полный список. Отсутствующий список не означает «все optional».
+YAML-покрытие больше не является release gate и вообще не участвует в runtime. Prepared можно включать для всех 55 только после того, как **в BarcodeGen** каждый exact builder получил полный `renderContract` и fixture tests. Отсутствующий `requiredFields` — ошибка контракта, а не «все optional».
 
-### 4.1.2. Три разных вида значений
+### 4.1.2. Пользовательские значения и server-owned identity
 
-Их нельзя хранить в одном двусмысленном `defaults`:
-
-- `preparedConstants` — hidden immutable engine values. Они применяются server-side и не имеют public field;
-- `fallbackValue` — стартовое **редактируемое** значение public field, взятое из exact BarcodeGen descriptor или явного semantic override;
-- существующие `defaults` — legacy/Auto fallback. Они не могут перезаписать Prepared field, включая явно отправленные `""`, `0` и `false`.
-
-Конфигурация невалидна, если один engine code одновременно является `preparedConstant` и public editable field. В Prepared сначала маппится полный semantic draft, затем добавляются только hidden constants. Explicit empty editable value не считается отсутствующим и не заменяется Auto default-ом.
+- Все public fields вводит или явно выбирает пользователь; generated/calculated поля остаются обычными редактируемыми inputs.
+- `initialValue` — только стартовое состояние frontend. Frontend включает его в action/final payload как явный выбор.
+- Если required key отсутствует, BFF возвращает validation error. Он не дописывает initial/default/fallback.
+- Optional `""`, `0` и `false` сохраняются буквально и не считаются отсутствующими.
+- `DAJ`, `DDB`, `QQQ` и format constants BarcodeGen получает по `profileId` и добавляет внутри exact operation/render; browser и BFF их не подменяют.
+- Common semantic fields имеют один общий codec BFF. Редкие исключения, например Georgia `county`, обязаны прийти из BarcodeGen metadata с безопасным `publicName`; state-specific YAML/switch в BFF запрещён.
 
 ### 4.1.3. Детерминированная нормализация descriptor-а
 
@@ -523,20 +504,21 @@ type PreparedRevisionSchema = {
 | `type: calendar` | `control: calendar`, `type: date`, public value `YYYY-MM-DD` |
 | `type: select` или `choiser` | `control: select`, `type: enum`, `values` → typed `options` |
 | `type: radio` | `control: radio`, `type: enum`; numeric values остаются numbers |
-| `type: icon` | `control: toggle`, `type: boolean`, `fallbackValue: false`; engine codec переводит `true` в профильное значение, `false` в отсутствие флага |
+| `type: icon` | `control: toggle`, `type: boolean`, `initialValue: false`; engine codec переводит `true` в профильное значение, `false` в отсутствие флага |
 
 Общие правила:
 
-- `title` используется только как label, identity поля определяется `abr`;
+- `title` используется как label, engine identity определяется `abr`, public identity — общим codec либо явным `publicName` BarcodeGen;
 - `pattern` переносится в validation без изменения смысла;
 - `order` присваивается по depth-first encounter order после исключения server-owned descriptors;
-- неизвестный `abr`, который входит в render allowlist или handler, не пропускается: профиль получает `PREPARED_PROFILE_INCOMPLETE` до показа формы;
+- каждый `requiredFields`/handler code обязан разрешиться в public field или server-owned value, иначе BFF возвращает `502 BARCODEGEN_BAD_METADATA`;
 - AAMVA-код никогда не становится public field name;
-- boolean/number не сериализуются в string ради удобства DOM.
+- boolean/number не сериализуются в string ради удобства DOM;
+- отсутствующий public key не заполняется из `initialValue` на BFF.
 
-### 4.2. Сокращённый пример schema для California DL
+### 4.2. Полный пример schema для California DL
 
-Пример намеренно показывает не всю форму, а только поля, необходимые для понимания action metadata. Реальный ответ обязан вернуть все поля профиля.
+Ниже полный публичный ответ для `US_CA_08292017/DL`, а не сокращённая иллюстрация. Общие данные человека вводит пользователь; пять служебных полей можно также заполнить кнопками, но они остаются редактируемыми. `initialValue` только инициализирует Vue state: BFF не применяет его как fallback.
 
 ```json
 {
@@ -545,13 +527,25 @@ type PreparedRevisionSchema = {
   "mode": "prepared",
   "revisionEffectiveDate": "2017-08-29",
   "fields": [
+    { "name": "firstName", "label": "First Name", "type": "string", "control": "input", "required": true, "order": 1, "validation": { "maxLength": 40, "pattern": "^[A-Za-z .,'-]+$" } },
+    { "name": "middleName", "label": "Middle Name", "type": "string", "control": "input", "required": false, "order": 2, "initialValue": "", "validation": { "maxLength": 40, "pattern": "^[A-Za-z .,'-]*$" } },
+    { "name": "lastName", "label": "Last Name", "type": "string", "control": "input", "required": true, "order": 3, "validation": { "maxLength": 40, "pattern": "^[A-Za-z .,'-]+$" } },
     {
-      "name": "dateOfBirth",
-      "label": "Date of Birth",
-      "type": "date",
-      "control": "calendar",
-      "required": true,
-      "order": 5
+      "name": "suffix", "label": "Name Suffix", "type": "enum", "control": "select", "required": false, "order": 4, "initialValue": "",
+      "options": [
+        { "value": "", "label": "None" }, { "value": "JR", "label": "Junior" }, { "value": "SR", "label": "Senior" },
+        { "value": "1ST", "label": "First" }, { "value": "2ND", "label": "Second" }, { "value": "3RD", "label": "Third" },
+        { "value": "4TH", "label": "Fourth" }, { "value": "5TH", "label": "Fifth" }, { "value": "6TH", "label": "Sixth" },
+        { "value": "7TH", "label": "Seventh" }, { "value": "8TH", "label": "Eighth" }, { "value": "9TH", "label": "Ninth" }
+      ]
+    },
+    { "name": "dateOfBirth", "label": "Date of Birth", "type": "date", "control": "calendar", "required": true, "order": 5 },
+    { "name": "street", "label": "Street Address", "type": "string", "control": "input", "required": true, "order": 6, "validation": { "maxLength": 35 } },
+    { "name": "city", "label": "City", "type": "string", "control": "input", "required": true, "order": 7, "validation": { "maxLength": 30 } },
+    { "name": "zipCode", "label": "ZIP Code", "type": "string", "control": "input", "required": true, "order": 8, "validation": { "pattern": "^\\d{5}(?:-\\d{4})?$" } },
+    {
+      "name": "sex", "label": "Sex", "type": "enum", "control": "radio", "required": true, "order": 9, "initialValue": 1,
+      "options": [{ "value": 1, "label": "Male" }, { "value": 2, "label": "Female" }]
     },
     {
       "name": "realId",
@@ -565,8 +559,31 @@ type PreparedRevisionSchema = {
         { "value": "N", "label": "Non-compliant" },
         { "value": "F", "label": "Fully compliant" }
       ],
-      "fallbackValue": ""
+      "initialValue": "F"
     },
+    { "name": "heightInches", "label": "Height (inches)", "type": "number", "control": "input", "required": true, "order": 11 },
+    { "name": "weightPounds", "label": "Weight (lb)", "type": "number", "control": "input", "required": true, "order": 12 },
+    {
+      "name": "eyeColor", "label": "Eye Color", "type": "enum", "control": "select", "required": true, "order": 13,
+      "options": [
+        { "value": "BLK", "label": "Black" }, { "value": "BLU", "label": "Blue" }, { "value": "BRO", "label": "Brown" },
+        { "value": "DIC", "label": "Dichromatic" }, { "value": "GRY", "label": "Gray" }, { "value": "GRN", "label": "Green" },
+        { "value": "HAZ", "label": "Hazel" }, { "value": "MAR", "label": "Maroon" }, { "value": "PNK", "label": "Pink" }, { "value": "UNK", "label": "Unknown" }
+      ]
+    },
+    {
+      "name": "hairColor", "label": "Hair Color", "type": "enum", "control": "select", "required": true, "order": 14,
+      "options": [
+        { "value": "BAL", "label": "Bald" }, { "value": "RED", "label": "Red/Auburn" }, { "value": "BLK", "label": "Black" },
+        { "value": "SDY", "label": "Sandy" }, { "value": "BLN", "label": "Blond" }, { "value": "WHI", "label": "White" },
+        { "value": "BRO", "label": "Brown" }, { "value": "GRY", "label": "Gray" }, { "value": "UNK", "label": "Unknown" }
+      ]
+    },
+    { "name": "vehicleClass", "label": "Vehicle Class", "type": "enum", "control": "select", "required": true, "order": 15, "initialValue": "C", "options": [{ "value": "A", "label": "Class A" }, { "value": "C", "label": "Class C" }] },
+    { "name": "restrictions", "label": "Restrictions", "type": "enum", "control": "select", "required": true, "order": 16, "initialValue": "NONE", "options": [{ "value": "NONE", "label": "None" }, { "value": "01", "label": "Corrective lenses" }] },
+    { "name": "endorsements", "label": "Endorsements", "type": "enum", "control": "select", "required": true, "order": 17, "initialValue": "NONE", "options": [{ "value": "NONE", "label": "None" }] },
+    { "name": "organDonor", "label": "Organ Donor", "type": "boolean", "control": "toggle", "required": false, "order": 18, "initialValue": false },
+    { "name": "veteran", "label": "Veteran", "type": "boolean", "control": "toggle", "required": false, "order": 19, "initialValue": false },
     {
       "name": "documentNumber",
       "label": "Customer ID Number",
@@ -622,13 +639,32 @@ type PreparedRevisionSchema = {
         "inputFields": ["issueDate", "documentNumber"],
         "outputFields": ["inventoryNumber"]
       }
+    },
+    {
+      "name": "documentDiscriminator",
+      "label": "Document Discriminator",
+      "type": "string",
+      "control": "input",
+      "required": true,
+      "order": 24,
+      "action": {
+        "id": "calculate:documentDiscriminator",
+        "type": "calculate",
+        "inputFields": ["issueDate", "expirationDate"],
+        "outputFields": ["documentDiscriminator"]
+      }
     }
   ],
-  "groups": []
+  "groups": [
+    { "name": "identity", "label": "Identity", "fields": ["firstName", "middleName", "lastName", "suffix", "dateOfBirth", "sex"] },
+    { "name": "address", "label": "Address", "fields": ["street", "city", "zipCode"] },
+    { "name": "physical", "label": "Physical description", "fields": ["heightInches", "weightPounds", "eyeColor", "hairColor"] },
+    { "name": "license", "label": "License", "fields": ["realId", "vehicleClass", "restrictions", "endorsements", "organDonor", "veteran", "documentNumber", "issueDate", "expirationDate", "inventoryNumber", "documentDiscriminator"] }
+  ]
 }
 ```
 
-Frontend не видит engine dependencies и не разбирает исходный `randomHandler`. Например, для California action дат browser отправляет `dateOfBirth` и `realId`; BFF сам добавляет внутренние `DAJ=CA` и `DDB=08292017`, затем маппит semantic values в `DBB/DDA` и outputs `DBD/DBA` обратно в `issueDate/expirationDate`.
+`Signature Image URL` и `Photo Image URL` отсутствуют: их нет в AAMVA Prepared contract. Frontend не видит engine dependencies и не разбирает `randomHandler`. Для action дат он отправляет только `dateOfBirth` и `realId`; BFF преобразует их в `DBB/DDA`, а BarcodeGen сам подмешивает `DAJ/DDB/QQQ` по `profileId` и возвращает `DBD/DBA`.
 
 ### 4.3. Откуда берутся actions и почему здесь не нужен второй registry
 
@@ -641,17 +677,11 @@ Actions также берутся из полного runtime payload BarcodeGen
 
 BFF не отдаёт browser-у право выбирать произвольные inputs/outputs. При построении schema он переводит разрешённый handler в короткий public action `{id,type,inputFields,outputFields}`. Базовые handlers имени (`DAC/DAD/DCS`), DOB (`DBB`) и адреса (`DAG/DAI/DAK`) BFF намеренно не публикует в Prepared, даже если они присутствуют в полном BarcodeGen payload.
 
-Отдельный `PreparedActions` registry, копирующий все `randomHandler/calculateHandler` для 55 профилей, **не создаётся**. Это и было бы переусложнением и вторым источником истины. На `POST /api/v1/barcode/action` BFF снова получает exact-profile payload ручкой `POST /api/internal/v1/barcodes/fields`, находит action по `actionId`, повторно применяет Prepared allowlist и только после этого вызывает `random` либо `calculate`. Поэтому клиент не может подменить handler, а BFF не хранит его дубликат.
+Отдельный `PreparedActions` registry, копирующий `randomHandler/calculateHandler` для 55 профилей, **не создаётся**. На `POST /api/v1/barcode/action` BFF снова получает exact payload по `profileId`, находит `actionId` в server metadata и только затем вызывает random/calculate. Клиент не может подменить handler.
 
-Каталог BFF хранит только то, чего нельзя безопасно брать из browser-а:
+BFF хранит только общий canonical semantic ↔ AAMVA codec и общий allowlist семейств Prepared actions (`DAQ`, `DBD+DBA`, отдельный `DBA`, `DCK`, `DCF`, `DCJ`). Он не хранит соответствие profile → identity, required/allowed fields, constants, defaults или отдельные state exceptions. Необычная зависимость или поле исправляется/описывается рядом с exact builder в BarcodeGen и возвращается metadata endpoint-ом.
 
-1. exact revision → `{country, DAJ, DDB, type}`;
-2. canonical semantic ↔ AAMVA mapping;
-3. server-owned constants и финальный render allowlist;
-4. Prepared allowlist семейств outputs: `DAQ`, `DBD+DBA`, отдельный `DBA`, `DCK`, `DCF`, `DCJ`;
-5. profile exceptions из раздела 7: отсутствующий action, исправление ошибочного self-edge и запрет US actions для ON/AB.
-
-Таким образом, форма и handler dependencies принадлежат BarcodeGen; BFF владеет auth, безопасностью, public semantic contract и orchestration. Никакого длинного Prepared-chain BFF автоматически не выполняет.
+Таким образом, exact profile, форма, handler dependencies и render contract принадлежат BarcodeGen; BFF владеет auth, безопасностью публичного DTO, Billing и общей orchestration. Никакого длинного Prepared-chain BFF автоматически не выполняет.
 
 ## 5. Состояние и рендер полной формы в новом frontend
 
@@ -706,13 +736,13 @@ type PreparedFormState = {
 2. Отменить или логически инвалидировать незавершённые schema/action запросы старой ревизии.
 3. Очистить прежние field errors, action errors и результат barcode.
 4. Для каждого `schema.fields` создать ключ `values[field.name]`.
-5. Если JSON field **содержит** свойство `fallbackValue`, записать его буквально, включая `""`, `0` или `false`.
+5. Если JSON field **содержит** свойство `initialValue`, записать его буквально, включая `""`, `0` или `false`.
 6. Иначе записать `""` как незаполненное UI-значение.
 7. Создать `fieldVersions[field.name] = 0`.
 8. Создать `actions[action.id] = {status: 'idle'}` для каждого уникального action.
 9. Рендерить поля по `groups`; поля, отсутствующие в группах, рендерить после групп по `order`.
 
-Нельзя использовать проверку `if (field.fallbackValue)`: она потеряет `0`, `false` и пустую строку. Нужна проверка наличия свойства, например `Object.hasOwn(field, 'fallbackValue')`.
+Нельзя использовать проверку `if (field.initialValue)`: она потеряет `0`, `false` и пустую строку. Нужна проверка наличия свойства, например `Object.hasOwn(field, 'initialValue')`.
 
 ### 5.3. Как рендерить поле
 
@@ -811,15 +841,15 @@ Content-Type: application/json
 Один клик выполняет следующий строгий алгоритм BFF:
 
 1. Проверить JSON shape и обязательные `revision`, `actionId`, `values`; лишние top-level properties отклонить.
-2. Загрузить enabled exact revision и explicit `barcodeGenContext`; неизвестная/disabled/incomplete revision завершается до BarcodeGen.
-3. Вызвать BarcodeGen `POST /api/internal/v1/barcodes/fields` с context и `flag=false`.
-4. Сверить identity envelope и прогнать `fields` через общий normalizer.
-5. Найти action с точным `actionId` в свежей normalized schema и повторно применить Prepared policy/exceptions раздела 7.
+2. Использовать `revision` как opaque `profileId`; не искать profile в YAML и не парсить ID.
+3. Вызвать BarcodeGen `POST /api/internal/v1/barcodes/fields` с `{profileId,flag:false}`.
+4. Сверить `profile.id`, проверить `renderContract` и прогнать `fields` через общий normalizer.
+5. Найти action с точным `actionId` в свежей normalized schema и проверить общее разрешённое семейство Prepared actions.
 6. Убедиться, что набор ключей `values` является точным допустимым semantic input-набором action: неизвестные, output-only, engine и server-owned keys запрещены.
 7. Проверить presence, тип, option membership, pattern и date rules каждого input по свежей schema.
 8. Преобразовать только разрешённые semantic inputs в engine values. Даты кодируются внутри BFF.
-9. Добавить `DAJ/DDB/QQQ` и только hidden `preparedConstants`; Auto defaults не участвуют.
-10. Вызвать ровно одну internal BarcodeGen route: random либо calculate. Только grouped action дат может повторить тот же random до 10 раз по разделу 6.4; metadata call при retry не повторяется.
+9. Не добавлять `DAJ/DDB/QQQ` или defaults: downstream body получает `profileId`, а identity/constants добавляет BarcodeGen.
+10. Вызвать ровно одну internal BarcodeGen route: random либо calculate с `{profileId,input,outputs}`. Только grouped action дат может повторить тот же random до 10 раз по разделу 6.4; metadata call при retry не повторяется.
 11. Не запускать `ChainExecutor` и не продолжать к следующему action.
 12. Проверить downstream status, JSON shape и наличие всех объявленных engine outputs.
 13. Отбросить неожиданные outputs, даже если BarcodeGen их вернул.
@@ -950,7 +980,7 @@ Frontend показывает ошибку возле action и соответс
 }
 ```
 
-BFF сам добавляет `DAJ=KY` и другие server-owned values из профиля.
+BFF отправляет `profileId=US_KY_08312018`; `DAJ=KY` и остальные server-owned values добавляет BarcodeGen exact profile.
 
 **Washington:** это два явных клика пользователя, а не одна автоматически продолжаемая цепочка.
 
@@ -973,10 +1003,11 @@ Frontend знает только BFF. BFF сам вызывает BarcodeGen; п
 
 | Этап | Frontend → BFF | BFF → BarcodeGen | Результат |
 |---|---|---|---|
-| Загрузка формы | `GET /api/v1/revisions/{revision}/schema?mode=prepared` | `POST /api/internal/v1/barcodes/fields` с `{country,DAJ,DDB,type,flag:false}` | identity envelope + полный `top + down[type]` payload нормализуются и возвращаются frontend |
-| Random-кнопка | `POST /api/v1/barcode/action` | сначала `POST /api/internal/v1/barcodes/fields` для серверной проверки handler-а, затем `POST /api/internal/v1/barcodes/random` | semantic patch только outputs одного action |
-| Calculate-кнопка | `POST /api/v1/barcode/action` | сначала `POST /api/internal/v1/barcodes/fields` для серверной проверки handler-а, затем `POST /api/internal/v1/barcodes/calculate` | semantic patch только outputs одного action |
-| Финальная Generate | `POST /api/v1/barcode/generate`, `mode=prepared` | `POST /api/internal/v1/barcodes/pdf417` после BFF validation/Billing Block | готовый barcode URL; random/calculate здесь не вызываются |
+| Каталог | `GET /api/v1/revisions` | `GET /api/internal/v1/barcodes/profiles` | BFF проксирует доступные `profileId`; YAML не читается |
+| Загрузка формы | `GET /api/v1/revisions/{profileId}/schema?mode=prepared` | `POST /api/internal/v1/barcodes/fields` с `{profileId,flag:false}` | exact identity + `renderContract` + полный `top + down[type]` нормализуются для frontend |
+| Random-кнопка | `POST /api/v1/barcode/action` | сначала `/fields` для проверки action, затем `/random` с `{profileId,input,outputs}` | semantic patch только outputs одного action |
+| Calculate-кнопка | `POST /api/v1/barcode/action` | сначала `/fields`, затем `/calculate` с `{profileId,input,outputs}` | semantic patch только outputs одного action |
+| Финальная Generate | `POST /api/v1/barcode/generate`, `mode=prepared` | `/fields` для final validation, затем `/pdf417` с `{profileId,ownerId,renderKey,values}` | готовый barcode URL; random/calculate здесь не вызываются |
 | Проверка неоднозначного render | frontend продолжает ждать ответ BFF | `GET /api/internal/v1/barcodes/renders/{renderKey}` только после timeout/unknown outcome | BFF завершает Capture либо Release без второго render |
 
 BarcodeGen service-to-service headers для internal routes:
@@ -993,39 +1024,60 @@ Internal `POST /api/internal/v1/barcodes/fields` защищён тем же `Ser
 
 Для **каждой** строки профиля ниже алгоритм одинаков и не должен быть реализован отдельным handler-ом:
 
-1. Frontend берёт `action` из текущего field schema. Он не конструирует engine inputs/outputs.
-2. Кнопка enabled только если заполнены её public `inputFields`. `DAJ`, `DDB`, `QQQ` и profile constants не считаются frontend inputs.
-3. Frontend отправляет BFF только `revision`, `actionId` и перечисленные semantic values.
-4. BFF загружает explicit `barcodeGenContext` exact revision.
-5. BFF вызывает `POST /api/internal/v1/barcodes/fields`, сверяет envelope, снова находит handler и проверяет Prepared policy. Inputs/outputs из browser request не принимаются.
-6. BFF маппит только разрешённые semantic inputs, затем добавляет server-owned context и hidden `preparedConstants`.
-7. BFF делает **один logical downstream action**:
-   - `random` → `POST /api/internal/v1/barcodes/random`;
-   - `calculate` → `POST /api/internal/v1/barcodes/calculate`.
-8. BFF проверяет, что BarcodeGen вернул все и только ожидаемые outputs, переводит их в semantic names/date format и отдаёт patch.
+1. Frontend берёт `action` из текущей schema. Он не конструирует engine inputs/outputs.
+2. Кнопка enabled только если заполнены public `inputFields`. `DAJ`, `DDB`, `QQQ` и constants не являются frontend inputs.
+3. Frontend отправляет BFF только `revision` (`profileId`), `actionId` и перечисленные semantic values.
+4. BFF не открывает YAML и не разбирает revision; он запрашивает `/fields` по `profileId`.
+5. BFF сверяет `profile.id`, `renderContract`, снова находит handler в metadata и не принимает inputs/outputs из browser request.
+6. BFF общим codec маппит только разрешённые semantic inputs. Profile identity/constants не добавляются в BFF payload: BarcodeGen восстанавливает их по `profileId`.
+7. BFF делает **один logical downstream action**: `/random` либо `/calculate` с `{profileId,input,outputs}`.
+8. BFF проверяет все ожидаемые outputs, переводит их в semantic names/date format и отдаёт patch.
 9. Frontend применяет только `response.values`. Следующая кнопка может стать enabled, но не нажимается программно.
 
-Если metadata call на шаге 5 неуспешен, BFF возвращает `502 BARCODEGEN_BAD_RESPONSE` (либо `504 BARCODEGEN_TIMEOUT` при timeout) и **не вызывает** random/calculate. Если live handler отличается от разрешённого профилем исключения раздела 7, BFF возвращает `502 BARCODEGEN_METADATA_MISMATCH`; угадывать dependencies или продолжать со старым клиентским handler нельзя.
+Если metadata call неуспешен, BFF возвращает `502 BARCODEGEN_BAD_RESPONSE` (либо `504 BARCODEGEN_TIMEOUT`) и **не вызывает** random/calculate. Если handler/render contract противоречив, BFF возвращает `502 BARCODEGEN_BAD_METADATA`; угадывать dependencies или продолжать по удалённому YAML нельзя.
 
-### 7.0.2. Точные downstream body
+### 7.0.2. Точные payload: Frontend → BFF → BarcodeGen
 
-Пример grouped dates:
+#### A. Random для пары дат California DL
+
+Frontend отправляет только public semantic values:
 
 ```http
-POST /api/internal/v1/barcodes/random
+POST /api/v1/barcode/action
+Content-Type: application/json
 ```
 
 ```json
 {
+  "revision": "US_CA_08292017",
+  "actionId": "random:documentDates",
+  "values": {
+    "dateOfBirth": "1994-07-19",
+    "realId": "F"
+  }
+}
+```
+
+BFF сначала проверяет action по `POST /api/internal/v1/barcodes/fields {"profileId":"US_CA_08292017","flag":false}`, затем делает ровно один downstream random:
+
+```http
+POST /api/internal/v1/barcodes/random
+Authorization: Bearer <BARCODEGEN_SERVICE_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "profileId": "US_CA_08292017",
   "input": {
-    "DAJ": "CA",
-    "DDB": "08292017",
     "DBB": "07191994",
-    "DDA": "1"
+    "DDA": "F"
   },
   "outputs": ["DBD", "DBA"]
 }
 ```
+
+`DAJ=CA`, `DDB=08292017` и `QQQ=DL` BarcodeGen получает из `profileId`; BFF не берёт их из YAML и не вставляет в body. BarcodeGen отвечает engine patch:
 
 ```json
 {
@@ -1036,7 +1088,7 @@ POST /api/internal/v1/barcodes/random
 }
 ```
 
-BFF преобразует ответ в public patch:
+BFF возвращает frontend semantic patch:
 
 ```json
 {
@@ -1050,17 +1102,27 @@ BFF преобразует ответ в public patch:
 }
 ```
 
-Пример calculate inventory:
+#### B. Calculate inventory number
 
-```http
-POST /api/internal/v1/barcodes/calculate
-```
+Frontend → BFF:
 
 ```json
 {
+  "revision": "US_CA_08292017",
+  "actionId": "calculate:inventoryNumber",
+  "values": {
+    "issueDate": "2023-04-16",
+    "documentNumber": "D1234567"
+  }
+}
+```
+
+BFF → BarcodeGen:
+
+```json
+{
+  "profileId": "US_CA_08292017",
   "input": {
-    "DAJ": "CA",
-    "DDB": "08292017",
     "DBD": "04162023",
     "DAQ": "D1234567"
   },
@@ -1068,39 +1130,150 @@ POST /api/internal/v1/barcodes/calculate
 }
 ```
 
-В реальном body должны присутствовать **ровно engine inputs конкретной строки профиля ниже**. Пример не отменяет дополнительные `DBB`, `DBA`, `DDA`, `DCK` или другие зависимости, если они перечислены у exact revision.
+BarcodeGen → BFF:
+
+```json
+{
+  "values": {
+    "DCK": "23106D12345670401"
+  }
+}
+```
+
+BFF → frontend:
+
+```json
+{
+  "success": true,
+  "revision": "US_CA_08292017",
+  "actionId": "calculate:inventoryNumber",
+  "values": {
+    "inventoryNumber": "23106D12345670401"
+  }
+}
+```
+
+В downstream body присутствуют **ровно** engine inputs action-а из свежей metadata. Identity/constants остаются внутри BarcodeGen exact profile.
+
+#### C. Финальный Prepared Generate и render
+
+Frontend → BFF передаёт полный semantic snapshot:
+
+```json
+{
+  "revision": "US_CA_08292017",
+  "barcodeType": "pdf417",
+  "mode": "prepared",
+  "units": 1,
+  "confirmed": true,
+  "fields": {
+    "firstName": "JOHN",
+    "middleName": "",
+    "lastName": "SMITH",
+    "suffix": "",
+    "dateOfBirth": "1994-07-19",
+    "street": "123 MAIN ST",
+    "city": "LOS ANGELES",
+    "zipCode": "90001",
+    "sex": 1,
+    "realId": "F",
+    "heightInches": 70,
+    "weightPounds": 180,
+    "eyeColor": "BRO",
+    "hairColor": "BRO",
+    "vehicleClass": "C",
+    "restrictions": "NONE",
+    "endorsements": "NONE",
+    "organDonor": false,
+    "veteran": false,
+    "documentNumber": "D1234567",
+    "issueDate": "2023-04-16",
+    "expirationDate": "2031-08-18",
+    "inventoryNumber": "23106D12345670401",
+    "documentDiscriminator": "04/16/2023ABCDE/1234/31"
+  }
+}
+```
+
+После свежего `/fields`, полной validation и Billing Block BFF вызывает BarcodeGen. Это уже engine payload, но без profile constants:
+
+```http
+POST /api/internal/v1/barcodes/pdf417
+Authorization: Bearer <BARCODEGEN_SERVICE_TOKEN>
+Content-Type: application/json
+```
+
+```json
+{
+  "profileId": "US_CA_08292017",
+  "ownerId": "user-42",
+  "renderKey": "generation-7c7a",
+  "values": {
+    "DAC": "JOHN",
+    "DAD": "",
+    "DCS": "SMITH",
+    "DCU": "",
+    "DBB": "07191994",
+    "DBC": 1,
+    "DAG": "123 MAIN ST",
+    "DAI": "LOS ANGELES",
+    "DAK": "90001",
+    "DDA": "F",
+    "DAU": "70",
+    "DAW": "180",
+    "DAY": "BRO",
+    "DAZ": "BRO",
+    "DCA": "C",
+    "DCB": "NONE",
+    "DCD": "NONE",
+    "DAQ": "D1234567",
+    "DBD": "04162023",
+    "DBA": "08182031",
+    "DCK": "23106D12345670401",
+    "DCF": "04/16/2023ABCDE/1234/31"
+  }
+}
+```
+
+`organDonor=false` и `veteran=false` не создают `DDK/DDL`; при `true` общий codec отправляет значение `1`. BarcodeGen по `profileId` сам выбирает CA DL builder, добавляет `DAJ/DDB/QQQ` и другие его constants, повторно проверяет `allowedFields/requiredFields`, затем рендерит. Финальный Generate не вызывает random/calculate.
 
 ### 7.0.3. Обязательный контракт BarcodeGen для BFF
 
 AI-кодер сначала проверяет наличие следующих routes в BarcodeGen. Если internal namespace ещё не реализован в целевой ветке BarcodeGen, его нужно добавить **ровно с этими DTO**, а не переключать BFF на старые PHP proxy и не вызывать public render.
 
 ```text
+GET /api/internal/v1/barcodes/profiles
+response: [{id,displayName,country,DAJ,DDB,type,revisionEffectiveDate}]
+side effects: нет
+```
+
+```text
 POST /api/internal/v1/barcodes/fields
-request:  {country, DAJ, DDB, type, flag:false}
-response: {profile:{country,DAJ,DDB,type}, fields:<полный top + down[type] payload>}
+request:  {profileId, flag:false}
+response: {profile:{id,country,DAJ,DDB,type,revisionEffectiveDate}, renderContract:{allowedFields,requiredFields}, fields:<полный top + down[type] payload>}
 errors:   404 PROFILE_NOT_FOUND без fallback на первый config
 side effects: нет
 ```
 
 ```text
 POST /api/internal/v1/barcodes/random
-request:  {input: Record<AAMVA, value>, outputs: string[]}
+request:  {profileId: string, input: Record<AAMVA, value>, outputs: string[]}
 response: {values: Record<AAMVA, value>}
 side effects: нет
 ```
 
 ```text
 POST /api/internal/v1/barcodes/calculate
-request:  {input: Record<AAMVA, value>, outputs: string[]}
+request:  {profileId: string, input: Record<AAMVA, value>, outputs: string[]}
 response: {values: Record<AAMVA, value>}
 side effects: нет
 ```
 
 ```text
 POST /api/internal/v1/barcodes/pdf417
-request:  {ownerId: string, renderKey: string, values: Record<AAMVA, value>}
+request:  {profileId: string, ownerId: string, renderKey: string, values: Record<AAMVA, value>}
 response: {id: string, url: string, type: "PDF417"}
-side effects: только idempotent render/persist по renderKey; НЕ Billing и НЕ Kafka user event
+side effects: exact builder добавляет identity/constants, валидирует renderContract и делает только idempotent render/persist; НЕ Billing и НЕ Kafka user event
 ```
 
 ```text
@@ -1123,9 +1296,9 @@ Public `POST /api/v1/barcodes/random|calculate` допустим только к
 
 означает полный сценарий:
 
-- BFF публикует соответствующую semantic кнопку только если такой handler пришёл в полном BarcodeGen payload и не запрещён profile exception;
+- BFF публикует semantic кнопку только если handler пришёл в полном BarcodeGen payload и относится к общему разрешённому семейству Prepared actions;
 - frontend ждёт только semantic аналоги клиентских engine inputs;
-- BFF сам добавляет server-owned engine inputs;
+- BFF передаёт `profileId`, а BarcodeGen сам добавляет server-owned identity/constants;
 - BFF вызывает `/api/internal/v1/barcodes/random` либо `/calculate` с указанными `outputs`;
 - BFF возвращает только semantic аналоги engine outputs;
 - ни одна следующая строка профиля не запускается автоматически.
@@ -1134,9 +1307,9 @@ Engine dependencies в профилях переводятся в public inputs 
 
 | Engine | Public/BFF source |
 |---|---|
-| `DAJ` | server-owned state из exact revision; frontend не отправляет |
-| `DDB` | server-owned revision value; frontend не отправляет |
-| `QQQ` и constants | server-owned profile context; frontend не отправляет |
+| `DAJ` | BarcodeGen exact profile по `profileId`; frontend/BFF action body не отправляют |
+| `DDB` | BarcodeGen exact profile по `profileId`; frontend/BFF action body не отправляют |
+| `QQQ` и constants | BarcodeGen exact builder contract; frontend/BFF не отправляют |
 | `DAC` | `firstName` |
 | `DAD` | `middleName` |
 | `DCS` | `lastName` |
@@ -1151,7 +1324,7 @@ Engine dependencies в профилях переводятся в public inputs 
 | `DCF` | `documentDiscriminator` |
 | `DCJ` | `auditCode` |
 
-Иными словами, если строка профиля содержит `[DAJ, DBD, DAQ]`, frontend button ждёт `issueDate + documentNumber`, а BFF сам добавляет `DAJ`. Если строка содержит только `[DAJ]`, public `inputFields=[]`, поэтому кнопка доступна сразу после загрузки schema.
+Иными словами, если handler профиля содержит `[DAJ, DBD, DAQ]`, frontend button ждёт `issueDate + documentNumber`, BFF отправляет их как `DBD + DAQ`, а BarcodeGen добавляет `DAJ` по `profileId`. Если handler содержит только `[DAJ]`, public `inputFields=[]`, поэтому кнопка доступна сразу после загрузки schema.
 
 Нормативные action IDs и patches:
 
@@ -1672,7 +1845,7 @@ Content-Type: application/json
     "vehicleClass": "C",
     "restrictions": "NONE",
     "endorsements": "NONE",
-    "height": 70,
+    "heightInches": 70,
     "weightPounds": 180,
     "eyeColor": "BRO",
     "hairColor": "BRO",
@@ -1688,26 +1861,25 @@ BFF в ветке `prepared`:
 
 1. Аутентифицирует пользователя и проверяет idempotency key по общему generate-контракту.
 2. Проверяет exact `mode` через `switch`; неизвестный mode отклоняется.
-3. Загружает enabled exact revision и его explicit `barcodeGenContext`/Prepared policy. Ничего не выводит из имени revision.
-4. Вызывает BarcodeGen `POST /api/internal/v1/barcodes/fields` с этим context и `flag=false`; сверяет identity envelope и строит ту же normalized schema, которую видел frontend.
-5. Проверяет верхнеуровневые `barcodeType`, `units`, `confirmed` и profile limits.
+3. Использует `revision` как opaque `profileId`; не загружает `RevisionConfig`/YAML и не разбирает ID.
+4. Вызывает BarcodeGen `POST /api/internal/v1/barcodes/fields` с `{profileId,flag:false}`; сверяет `profile.id`, `renderContract` и строит ту же normalized schema, которую видел frontend.
+5. Проверяет верхнеуровневые `barcodeType`, `units`, `confirmed` и общие product limits.
 6. Проверяет, что каждый ключ `fields` является canonical semantic field свежей schema.
 7. Отклоняет raw AAMVA, server-owned, alias и неизвестные keys до Quote/Billing.
-8. Проверяет required presence. Пробельная string считается пустой; `0` и `false` не считаются отсутствующими.
-9. Проверяет типы, typed options membership, min/max, pattern и profile-specific правила.
+8. Проверяет required presence по `renderContract.requiredFields`. Пробельная string считается пустой; `0` и `false` не считаются отсутствующими.
+9. Проверяет типы, typed options membership, min/max, pattern и metadata rules exact builder-а.
 10. Парсит semantic dates как calendar dates, проверяет реальность даты и ограничения возраста/ревизии.
 11. Проверяет совместные правила: `revisionEffectiveDate <= issueDate <= today` и `issueDate < expirationDate`.
 12. **Не вызывает** `prepare`, `ChainExecutor`, random или calculate.
 13. Маппит semantic draft в новую engine-карту; canonical mapper не принимает legacy aliases `idNumber`, `dlNumber`, `expiryDate`.
-14. Кодирует даты, boolean и единицы измерения по country/profile rules.
-15. Добавляет `DAJ/DDB/QQQ` из context и только hidden `preparedConstants`. Auto `defaults` не заменяют ни присутствующее, ни явно пустое Prepared field.
-16. Строит render payload только по engine `renderAllowlist` exact profile.
-17. Проверяет `requiredRenderFields` уже на готовой engine-карте.
-18. Только после metadata и всех validation вызывает Quote и Billing Block.
-19. Вызывает `POST /api/internal/v1/barcodes/pdf417` ровно один раз с `{ownerId,renderKey,values}`.
-20. При успехе делает Capture, записывает history и возвращает barcode list.
-21. При timeout/unknown outcome сначала проверяет `GET /api/internal/v1/barcodes/renders/{renderKey}` и не запускает второй render вслепую.
-22. При подтверждённой ошибке render делает Release и возвращает нормализованную ошибку.
+14. Кодирует даты, boolean и единицы измерения по metadata профиля.
+15. Не добавляет constants/defaults и не подставляет отсутствующие public values.
+16. Проверяет engine keys по `renderContract.allowedFields` и наличие `requiredFields`.
+17. Только после metadata и всех validation вызывает Quote и Billing Block.
+18. Вызывает `POST /api/internal/v1/barcodes/pdf417` ровно один раз с `{profileId,ownerId,renderKey,values}`; exact builder BarcodeGen сам добавляет identity/constants.
+19. При успехе делает Capture, записывает history и возвращает barcode list.
+20. При timeout/unknown outcome сначала проверяет `GET /api/internal/v1/barcodes/renders/{renderKey}` и не запускает второй render вслепую.
+21. При подтверждённой ошибке render делает Release и возвращает нормализованную ошибку.
 
 Metadata call на шаге 4 не является random/calculate и ничего не генерирует. Он нужен, потому что BFF больше не хранит вторую полную копию формы и обязан валидировать final payload по текущему exact BarcodeGen contract, а не по данным, присланным browser-ом.
 
@@ -1716,20 +1888,20 @@ Metadata call на шаге 4 не является random/calculate и ниче
 ```go
 switch req.Mode {
 case "auto":
-    values = chainExecutor.ExecuteGrouped(ctx, profile, req.Fields)
+    values = autoFlow.Execute(ctx, req.Revision, req.Fields)
 case "prepared":
-    sourcePayload = barcodeGen.GetFullFields(ctx, profile.BarcodeGenContext)
-    verifyProfileEnvelope(profile.BarcodeGenContext, sourcePayload.Profile)
-    schema = normalizePreparedSchema(profile, sourcePayload.Fields)
+    sourcePayload = barcodeGen.GetFullFields(ctx, req.Revision) // revision == profileId
+    verifyProfileAndRenderContract(req.Revision, sourcePayload)
+    schema = normalizePreparedSchema(sourcePayload)
     semanticDraft = validateCompletePreparedFields(schema, req.Fields)
-    values = mapPreparedSemanticToEngine(profile, semanticDraft)
-    values = addPreparedConstants(values, profile.PreparedConstants)
+    values = mapPreparedSemanticToEngine(sourcePayload.Profile, semanticDraft)
+    validateAllowedAndRequired(values, sourcePayload.RenderContract)
 default:
     return ErrUnsupportedMode
 }
 ```
 
-Engine allowlist применяется **после** semantic mapping. Нельзя сначала фильтровать semantic keys engine allowlist-ом. Нельзя оставлять проверку `if mode != "prepared"`, потому что опечатка в mode иначе запустит Auto.
+`renderContract.allowedFields` из BarcodeGen применяется **после** semantic mapping. Нельзя сначала фильтровать semantic keys engine allowlist-ом и нельзя хранить отдельную копию списка в BFF. Нельзя оставлять проверку `if mode != "prepared"`, потому что опечатка в mode иначе запустит Auto.
 
 ### 8.3. Успешный ответ BFF
 
@@ -1829,31 +2001,33 @@ verify/add BarcodeGen internal routes from 7.0.3
    - `inventoryNumber`;
    - `documentDiscriminator`;
    - `auditCode`.
-   Существующие общие имена `zipCode`, `height`, `weightPounds` сохранить едиными.
-3. Добавить `BarcodeGenContext` в `RevisionConfig`/YAML и мигрировать все enabled profiles. Запрещено выводить context из имени revision или `defaults.QQQ`.
-4. Добавить в BarcodeGen internal `POST /api/internal/v1/barcodes/fields`: exact lookup, проверка `down[type]`, identity envelope, никакого fallback.
-5. Добавить в BarcodeGen adapter метод `GetFullFields(ctx, BarcodeGenContext)`, использующий service token. HTTP handler BFF не обращается к downstream напрямую.
-6. `RevisionSchemaUseCase` получает exact profile store и adapter. Порядок: profile lookup → fields endpoint → envelope verification → normalization → response.
-7. Расширить `internal/domain/revision_schema.go`:
+   Общие имена `zipCode`, `heightInches`, `weightPounds` использовать единообразно; legacy `height` не принимать как параллельный alias.
+3. Полностью удалить `configs/revisions/*.yaml`, `RevisionConfigStore` и их wiring из schema/prepare/generate. Не мигрировать содержимое YAML в Go registry.
+4. Добавить в BarcodeGen `GET /api/internal/v1/barcodes/profiles`; `GET /api/v1/revisions` BFF становится auth-aware proxy этого catalog.
+5. Расширить BarcodeGen `POST /api/internal/v1/barcodes/fields`: request `{profileId,flag:false}`, exact lookup без fallback, identity envelope и `renderContract.{allowedFields,requiredFields}` рядом с descriptors.
+6. Каждый BarcodeGen builder получает audited `requiredFields`, `allowedFields`, `revisionEffectiveDate` и fixture tests. Identity/constants остаются внутри exact builder.
+7. Добавить в BFF adapter методы `ListProfiles(ctx)` и `GetFullFields(ctx, profileId)`, использующие service token. HTTP handlers не обращаются к downstream напрямую.
+8. `RevisionSchemaUseCase` получает только adapter. Порядок: `profileId` → fields endpoint → envelope/renderContract verification → normalization → response.
+9. Расширить `internal/domain/revision_schema.go`:
    - добавить `Control` в `FieldSchema`;
    - заменить `Options []string` + `OptionItems []FieldOption` одним typed `Options []FieldOption`;
-   - добавить optional public `Action`;
+   - добавить optional `InitialValue` и public `Action`;
    - добавить root `Mode`; ответ на `?mode=prepared` всегда содержит `"mode":"prepared"`.
-8. Написать один pure normalizer: recursive depth-first walk arrays, descriptors определяются по `abr`; server-owned поля отбрасываются; одинаковые duplicates дедуплицируются, конфликтующие отклоняются. Generated/calculated fields не фильтруются.
-9. `required` вычислять только из полного `requiredRenderFields`; hidden constants удовлетворяются server-side. Профиль с неизвестным required code не включать.
-10. Разделить `preparedConstants`, editable `fallbackValue` и Auto defaults. Prepared не применяет Auto default поверх присутствующего semantic key, даже если значение falsy.
-11. Не создавать `PreparedActions` рядом с live handlers. На schema load и action call action разрешается по exact payload плюс коротким exceptions раздела 7.
-12. Для public action использовать только `{id,type,inputFields,outputFields}`. Engine arrays остаются внутри BFF. `DisplayField`: `DBD+DBA` у `issueDate`, отдельный `DBA` у `expirationDate`, остальные у собственного output field.
-13. Не публиковать actions имени, DOB и адреса. Проверять уникальность semantic names/action IDs, typed options, существование inputs/outputs и отсутствие engine keys в public schema.
-14. Не добавлять distributed cache, schema session ID или persistence layer. Сначала прямой runtime call.
+10. Написать pure normalizer: recursive depth-first walk arrays, descriptors по `abr`; common fields разрешаются общим codec, редкие — metadata `publicName`; generated/calculated fields не фильтруются.
+11. `required` вычислять только из `renderContract.requiredFields`. Неизвестный required code, пустой contract или required вне allowed возвращает `502 BARCODEGEN_BAD_METADATA`.
+12. BFF не применяет defaults/constants. `initialValue` только передаётся frontend, а отсутствие required public key является ошибкой.
+13. Не создавать `PreparedActions`/state exceptions рядом с live handlers. Action разрешается по свежему exact payload и общему allowlist семейств.
+14. Для public action использовать только `{id,type,inputFields,outputFields}`. Engine arrays остаются внутри BFF. `DBD+DBA` показываются у `issueDate`, отдельный `DBA` — у `expirationDate`.
+15. Не публиковать actions имени, DOB и адреса. Проверять uniqueness, typed options, существование inputs/outputs и отсутствие engine keys в public schema.
+16. Не добавлять distributed cache, schema session ID или persistence layer. Сначала прямой runtime call.
 
 ### 9.2. BFF: action endpoint
 
 1. Добавить request/response DTO с точными полями `revision`, `actionId`, `values`.
 2. Добавить route `POST /api/v1/barcode/action` в существующий `/api/v1` router и применить ту же auth middleware, что у generation endpoints.
 3. Добавить отдельный `PreparedActionUseCase`; HTTP handler только decode → execute → encode.
-4. Use case получает exact profile store и один BarcodeGen adapter с методами `GetFullFields`, `Derive(random|calculate)`.
-5. На каждый action выполнить явную последовательность: exact profile lookup → `GetFullFields(flag=false)` → найти handler по server-side metadata → применить Prepared policy/exceptions → проверить только объявленные semantic inputs → добавить server context → один `Derive` → проверить outputs → вернуть semantic patch.
+4. Use case получает только BarcodeGen adapter с методами `GetFullFields(profileId)` и `Derive(profileId, random|calculate)`; profile store отсутствует.
+5. На каждый action выполнить: `GetFullFields(profileId,flag=false)` → проверить identity/renderContract → найти handler → проверить объявленные semantic inputs → общий mapping → один `Derive` с `profileId` → проверить outputs → вернуть semantic patch. BFF не добавляет state/revision/constants.
 6. Не принимать от frontend `kind`, engine `input`, engine `outputs`, `randomHandler` или `calculateHandler`. Даже если клиент добавил их в JSON, strict decoder обязан вернуть `400 VALIDATION_ERROR`.
 7. Не инжектировать и не вызывать Billing, render client, history repository или `ChainExecutor` из этого use case.
 8. Для date action переиспользовать единый helper атомарной проверки `DBD/DBA` и лимит 10 derive-попыток. Metadata payload запрашивается один раз на action request, а не на каждую retry-попытку.
@@ -1864,18 +2038,18 @@ verify/add BarcodeGen internal routes from 7.0.3
 ### 9.3. BFF: финальный generate(mode=prepared)
 
 1. В `generate_usecase.go` заменить условие вида `mode != "prepared"` на exact `switch`.
-2. В prepared branch до validation вызвать `GetFullFields(ctx, profile.BarcodeGenContext)`; это один `POST /api/internal/v1/barcodes/fields` с `flag=false`, без random/calculate side effects.
-3. Сверить identity envelope и нормализовать `fields` тем же pure normalizer, что использует schema endpoint. Не писать вторую validation schema для generate.
-4. Разделить prepared validation и engine mapping на явные функции; не пропускать публичный map напрямую в render filter.
-5. Разрешить только field names из свежей exact schema. Это автоматически отклоняет AAMVA, server-owned и старые aliases.
-6. Проверить full semantic draft по разделу 8.2.
-7. Затем создать новую engine-карту через canonical semantic mapping.
-8. Затем применить country/profile codecs и hidden `preparedConstants`; Auto defaults в prepared branch не применять.
-9. Только потом применить `renderAllowlist` и проверить `requiredRenderFields`.
+2. В prepared branch вызвать `GetFullFields(ctx, req.Revision)`; `req.Revision` является `profileId`. Это один metadata call без random/calculate side effects.
+3. Сверить `profile.id`, проверить `renderContract` и нормализовать `fields` тем же normalizer, что использует schema endpoint.
+4. Разделить prepared validation и engine mapping; не пропускать public map напрямую в render filter.
+5. Разрешить только field names свежей schema; raw AAMVA/server-owned/aliases отклонить.
+6. Проверить полный semantic draft по разделу 8.2, включая `requiredFields` и explicit `""`/`0`/`false`.
+7. Создать engine-карту общим mapping и profile codecs из metadata.
+8. Не применять BFF defaults/constants и не парсить profileId.
+9. После mapping проверить `renderContract.allowedFields/requiredFields`.
 10. Убедиться тестом, что prepared branch не вызывает `ChainExecutor`, random, calculate или `prepare`.
 11. Все metadata/validation errors вернуть до Quote/Billing.
-12. Render вызвать только через `POST /api/internal/v1/barcodes/pdf417`; public `/api/v1/barcodes/pdf417` не использовать, чтобы BFF и BarcodeGen не сделали Billing/Kafka side effects дважды.
-13. Сохранить существующий общий ответ `GenerateResult` с `barcodes[]`, чтобы не ломать отображение результата в новом frontend.
+12. Render вызвать только через internal `/pdf417` с `{profileId,ownerId,renderKey,values}`; BarcodeGen exact builder добавляет constants и повторно проверяет contract.
+13. Сохранить общий ответ `GenerateResult` с `barcodes[]`.
 
 ### 9.4. Frontend: `app/shared/api/types.ts`
 
@@ -1972,34 +2146,31 @@ interface PreparedActionResult {
 
 ### 10.1. Runtime metadata/schema contract tests BFF
 
-Для каждого из 55 профилей BarcodeGen payload фиксируется как test fixture ответа `POST /api/internal/v1/barcodes/fields`; отдельную копию полной BFF-формы для теста не создаём. Тест автоматически проверяет:
+Для каждого из 55 профилей BarcodeGen payload фиксируется как fixture самого exact builder-а и как contract fixture ответа `/fields`; отдельную копию формы/required policy в BFF не создаём. Тест автоматически проверяет:
 
-- exact revision загружается и преобразуется в правильные `{country,DAJ,DDB,type,flag:false}`;
-- adapter действительно вызывает `/api/internal/v1/barcodes/fields`, а не PHP URL/public metadata route/локальный hardcoded form;
-- route возвращает exact identity envelope, `top` и `down[type]`; normalizer не теряет ни одного renderable field;
+- `/profiles` возвращает уникальный `profileId` для каждой пары revision/type;
+- BFF отправляет `/fields` ровно `{profileId,flag:false}`, а не `{country,DAJ,DDB,type}` из YAML;
+- route возвращает exact identity, `renderContract`, `top` и `down[type]`; normalizer не теряет renderable field;
 - unknown profile/type возвращает `404` без fallback; mismatch envelope превращается BFF в `502`;
-- публичная schema содержит только canonical semantic field names;
-- каждый action ID уникален внутри профиля;
-- public semantic inputs/outputs существуют в `schema.fields`;
-- handler engine inputs/outputs соответствуют exact payload и исключениям матрицы раздела 7;
-- public action projection не содержит engine keys;
-- generated/calculated output присутствует как редактируемое поле;
-- actions имени, DOB и адреса отфильтрованы;
-- enum options typed, а fallback входит в options;
-- recursive normalizer корректно flatten-ит реальные nested arrays; identical duplicate `abr` дедуплицируется, conflict отклоняется;
-- каждый `requiredRenderFields` code имеет public field либо hidden constant; пустой required policy блокирует профиль;
-- public editable code не пересекается с `preparedConstants`, а Auto default не перезаписывает falsy Prepared value;
-- `revisionEffectiveDate` валидна;
-- ON/AB не получают US actions;
-- один schema request вызывает BarcodeGen metadata ровно один раз.
+- каждый `allowedFields`/`requiredFields` code существует в exact builder contract, required является подмножеством allowed;
+- удаление каждого required value подтверждается negative builder fixture; отсутствие contract блокирует профиль;
+- публичная schema содержит только canonical semantic names; редкое поле имеет metadata `publicName`;
+- каждый action ID уникален; public inputs/outputs существуют в `schema.fields` и не содержат engine keys;
+- handler inputs/outputs соответствуют exact BarcodeGen payload;
+- generated/calculated outputs остаются редактируемыми, actions имени/DOB/адреса отфильтрованы;
+- enum options typed, а `initialValue`, если задан, входит в options;
+- recursive normalizer flatten-ит nested arrays; identical duplicate `abr` дедуплицируется, conflict отклоняется;
+- `revisionEffectiveDate` валидна; ON/AB не получают US actions;
+- один schema request вызывает BarcodeGen metadata ровно один раз;
+- test binary BFF не загружает `configs/revisions/*.yaml` и не имеет state-specific profile registry.
 
 ### 10.2. Action use-case и HTTP contract tests BFF
 
 Минимальный набор:
 
 1. Разрешённый action сначала вызывает BarcodeGen metadata, затем получает только свои semantic inputs и возвращает только semantic outputs.
-2. Metadata request содержит exact `{country,DAJ,DDB,type,flag:false}` и выполняется ровно один раз на action request.
-3. Action без публичных inputs работает с `values={}` и получает server context из exact revision.
+2. Metadata request содержит exact `{profileId,flag:false}` и выполняется ровно один раз на action request.
+3. Action без публичных inputs работает с `values={}`; downstream получает `profileId`, а identity/constants добавляет BarcodeGen.
 4. Неизвестный/запрещённый live handler возвращает `422 ACTION_NOT_ALLOWED`; random/calculate downstream не вызывается.
 5. Metadata timeout/malformed response/profile mismatch возвращает нормализованный `502`; derive не вызывается.
 6. Missing input возвращает `422 ACTION_INPUT_MISSING`.
@@ -2018,30 +2189,30 @@ interface PreparedActionResult {
 
 Нужны отдельные spy/mock assertions:
 
-- prepared request сначала вызывает metadata `POST /api/internal/v1/barcodes/fields` ровно один раз с exact context и `flag=false`;
-- metadata error/profile mismatch останавливает flow до Quote/Billing/render;
-- clean full semantic payload успешно доходит до internal render;
-- semantic mapping происходит до engine allowlist;
-- prepared branch ни разу не вызывает `prepare`, `ChainExecutor`, random или calculate;
+- prepared request вызывает `/fields` ровно один раз с `{profileId,flag:false}`;
+- metadata/renderContract error останавливает flow до Quote/Billing/render;
+- full semantic payload успешно доходит до internal render;
+- semantic mapping происходит до проверки `allowedFields/requiredFields`;
+- prepared branch не вызывает `prepare`, `ChainExecutor`, random или calculate;
 - unknown mode не попадает в Auto;
 - raw AAMVA/server-owned/alias/unknown key отклоняется до Quote/Billing;
-- incomplete/invalid prepared payload отклоняется до Quote/Billing;
-- `""`, `0` и `false` сохраняются и валидируются правильно; Auto defaults их не заменяют;
-- ISO dates кодируются в `MMDDYYYY` для US и `YYYYMMDD` для ON/AB только внутри BFF;
-- hidden `preparedConstants` нельзя подменить, и они не появляются в public schema;
-- render получает только allowlisted engine keys через `/api/internal/v1/barcodes/pdf417`;
+- incomplete/invalid payload отклоняется до Quote/Billing;
+- отсутствующий required select не получает initial/default; `""`, `0`, `false` сохраняются буквально;
+- ISO dates кодируются в engine format только внутри BFF;
+- render body содержит `{profileId,ownerId,renderKey,values}` и не содержит вручную добавленных BFF `DAJ/DDB/QQQ`;
+- BarcodeGen exact builder добавляет identity/constants и повторно валидирует render contract;
 - public `/api/v1/barcodes/pdf417` не вызывается;
-- Billing Block происходит после metadata/validation, Capture после render success, Release после confirmed render failure;
+- Billing Block происходит после metadata/validation, Capture после success, Release после confirmed failure;
 - render timeout сначала проверяется через `GET /api/internal/v1/barcodes/renders/{renderKey}`;
-- одинаковый idempotency key и одинаковый snapshot не создают двойной charge/render/history record;
-- успешный ответ соответствует существующему `GenerateResult` с `barcodes[]`.
+- одинаковый idempotency key/snapshot не создаёт двойной charge/render/history;
+- успешный ответ соответствует `GenerateResult.barcodes[]`.
 
 ### 10.4. Frontend unit/component tests
 
 Покрыть новый `usePreparedForm`/страницу:
 
 1. Все schema fields рендерятся; generated outputs не фильтруются.
-2. `fallbackValue` сохраняет `""`, `0` и `false`.
+2. `initialValue` сохраняет `""`, `0` и `false`.
 3. Enum показывает label и отправляет typed value.
 4. Date остаётся `YYYY-MM-DD`; `toEngineDate` не вызывается и отсутствует.
 5. Action button visible только при наличии `field.action`.
@@ -2112,7 +2283,7 @@ interface PreparedActionResult {
 7. Raw AAMVA, server-owned, old alias или unknown key отклоняется до Quote/Billing.
 8. Пользователь может полностью заполнить Prepared форму без использования actions.
 9. Имя, DOB и адрес не имеют Prepared actions и никогда не генерируются этими кнопками.
-10. Каждая показанная кнопка получена BFF из полного exact-profile payload BarcodeGen и пропущена через Prepared policy.
+10. Каждая показанная кнопка получена BFF из полного exact-profile payload BarcodeGen и пропущена только через общий allowlist семейств Prepared actions; profile-specific policy в BFF отсутствует.
 11. Один клик выполняет один metadata lookup и один logical random/calculate action; date retry не запускает другие actions.
 12. Следующий action никогда не запускается автоматически.
 13. BFF не доверяет присланным клиентом dependencies/outputs/handlers и повторно разрешает action по server-side metadata.
@@ -2125,7 +2296,7 @@ interface PreparedActionResult {
 20. Финальный клик Prepared напрямую вызывает `generate(mode=prepared)` без `prepare`.
 21. Финальный `mode=prepared` не вызывает `ChainExecutor`, random или calculate.
 22. Полнота и validation проверяются до Quote/Billing.
-23. Semantic → engine mapping выполняется до render allowlist.
+23. Semantic → engine mapping выполняется до проверки `renderContract.allowedFields/requiredFields`, полученного от BarcodeGen.
 24. Неизвестный mode не попадает в Auto Flow.
 25. Повтор одного неизменённого final snapshot не создаёт двойной charge/render благодаря стабильному idempotency key.
 26. Успешный frontend использует существующий ответ `GenerateResult.barcodes[]`.
@@ -2133,11 +2304,13 @@ interface PreparedActionResult {
 28. ON/AB не получают выдуманные US helper rules.
 29. Vue state не сохраняет PII draft в localStorage/persisted store.
 30. California и Washington browser acceptance flows из раздела 10.5 проходят.
-31. При каждом выборе revision BFF вызывает `POST /api/internal/v1/barcodes/fields` с explicit context и `flag=false`, сверяет identity envelope и отдаёт полную normalized schema.
+31. При каждом выборе revision BFF вызывает `/fields` с `{profileId,flag:false}`, сверяет identity/renderContract и отдаёт полную normalized schema.
 32. Browser ни на одном этапе не вызывает BarcodeGen напрямую и не получает BarcodeGen credentials.
 33. Schema/action не используют второй hardcoded список полной формы или копию всех handlers в BFF.
 34. Internal fields route не имеет silent fallback; неизвестный profile/type возвращает `404`, mismatch envelope — `502` из BFF.
 35. Random вызывает только `/api/internal/v1/barcodes/random`, calculate — только `/api/internal/v1/barcodes/calculate`, финальный PDF417 render — только `/api/internal/v1/barcodes/pdf417`.
-36. Каждый enabled Prepared profile имеет explicit `barcodeGenContext`, полный `requiredRenderFields` и fixture test; отсутствие policy не трактуется как optional form.
-37. Public editable fields не пересекаются с hidden `preparedConstants`; Auto defaults не перезаписывают Prepared values, включая `""`, `0`, `false`.
-38. BFF не парсит revision ID для получения `country/DAJ/DDB/type`.
+36. `configs/revisions/*.yaml`, `RevisionConfigStore`, BFF profile defaults/required/render policies и синхронизация whitelist из YAML удалены из runtime и wiring.
+37. Каждый Prepared profile имеет `renderContract.allowedFields/requiredFields` и builder fixture в BarcodeGen; отсутствие contract не трактуется как optional form.
+38. BFF не парсит profileId, не добавляет `DAJ/DDB/QQQ` и не применяет profile constants/defaults.
+39. Public `initialValue` никогда не применяется BFF как fallback; отсутствующий required key отклоняется, а `""`, `0`, `false` сохраняются.
+40. Все action/render payloads BFF → BarcodeGen содержат `profileId`, как показано в разделе 7.
