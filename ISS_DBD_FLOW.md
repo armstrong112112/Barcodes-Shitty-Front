@@ -9,6 +9,8 @@
 
 Все границы хранятся в ISO-формате `YYYY-MM-DD`. Формат конкретного поля (`MMDDYYYY`, `YYYYMMDD` и т. п.) применяется только при вызове `BarcodeGen`.
 
+`DBA` (expiration date) не может быть в прошлом: после строгого парсинга BFF обязан проверить `DBA >= today` как календарную дату. В текущем `BarcodeGen` такой явной проверки нет, поэтому BFF применяет её ко всем источникам `DBA`: паре `random[DBD, DBA]`, отдельному `calculate[DBA]`, ручному вводу и финальной валидации Prepared payload. Просроченный результат BarcodeGen считается невалидным; вручную введённый просроченный `DBA` возвращает validation error до Billing/render.
+
 ## Автогенерация
 
 1. Определить окно выдачи: `minIssueDate .. min(maxIssueDate ?? today, today)`.
